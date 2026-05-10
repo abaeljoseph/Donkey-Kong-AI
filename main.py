@@ -37,7 +37,8 @@ def parse_args():
     # Shared
     p.add_argument('--num-envs',    type=int,   default=8,   help='Parallel environments')
     p.add_argument('--render',      action='store_true', help='Render game window (env 0 only)')
-    p.add_argument('--arm-gui',     action='store_true', help='Show PyBullet arm GUI')
+    p.add_argument('--arm',         action='store_true', help='Enable PyBullet robot arm')
+    p.add_argument('--arm-gui',     action='store_true', help='Show PyBullet arm GUI (implies --arm)')
     p.add_argument('--load-model',  type=str,   default=None,
                    help='DQN: path to .pt file; PPO: path without .zip extension')
     p.add_argument('--eval-only',   action='store_true')
@@ -57,6 +58,7 @@ def main():
             total_timesteps=args.timesteps,
             num_envs=args.num_envs,
             render=args.render,
+            use_arm=args.arm or args.arm_gui,
             arm_gui=args.arm_gui,
             load_model=args.load_model,
             eval_only=args.eval_only,

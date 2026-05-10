@@ -5,39 +5,46 @@ maps a small discrete action set, and computes a shaped reward.
 """
 
 import collections
+import random
 import numpy as np
 import cv2
 import retro
 
 
 # NES button layout in stable-retro: B, NULL, SELECT, START, UP, DOWN, LEFT, RIGHT, A
+# NES button layout: [B, NULL, SELECT, START, UP, DOWN, LEFT, RIGHT, A]
+# In NES Donkey Kong, A button (index 8) is jump — B does nothing.
 DISCRETE_ACTIONS = [
     [0, 0, 0, 0, 0, 0, 0, 0, 0],   # 0: NOOP
     [0, 0, 0, 0, 0, 0, 1, 0, 0],   # 1: LEFT
     [0, 0, 0, 0, 0, 0, 0, 1, 0],   # 2: RIGHT
     [0, 0, 0, 0, 1, 0, 0, 0, 0],   # 3: UP  (climb ladder)
     [0, 0, 0, 0, 0, 1, 0, 0, 0],   # 4: DOWN (climb down)
-    [1, 0, 0, 0, 0, 0, 0, 0, 0],   # 5: JUMP (B)
-    [1, 0, 0, 0, 0, 0, 1, 0, 0],   # 6: JUMP + LEFT
-    [1, 0, 0, 0, 0, 0, 0, 1, 0],   # 7: JUMP + RIGHT
+    [0, 0, 0, 0, 0, 0, 0, 0, 1],   # 5: JUMP (A)
+    [0, 0, 0, 0, 0, 0, 1, 0, 1],   # 6: JUMP + LEFT  (A + LEFT)
+    [0, 0, 0, 0, 0, 0, 0, 1, 1],   # 7: JUMP + RIGHT (A + RIGHT)
 ]
 NUM_ACTIONS = len(DISCRETE_ACTIONS)
 
 FRAME_H     = 84
 FRAME_W     = 84
 FRAME_STACK = 4
-FRAME_SKIP  = 4      # hold each action for N frames (4x speedup)
-MAX_STEPS   = 500    # decision steps per episode (= 2000 emulator frames, ~33s game time)
+OBS_CHANNELS = 5    # 4 grayscale + 1 teal/ladder channel
+FRAME_SKIP  = 8      # hold each action for N frames
+MAX_STEPS   = 1200   # decision steps per episode (randomised ±200 per env to stagger resets)
 
 # Donkey Kong NES level 1: Mario starts near Y=176, princess is near Y=22.
 # Y decreases as Mario climbs (NES screen origin is top-left).
 MARIO_Y_START = 176
 MARIO_Y_WIN   = 30   # reaching this Y or lower = level complete
 
+TOTAL_HEIGHT = MARIO_Y_START - MARIO_Y_WIN   # ~146 NES pixels, full climb distance
+
 # Ghost viewer frame settings
 DETECT_W          = 160   # detection frame width  (half NES res, keeps Mario ≥3 skin px)
 DETECT_H          = 150   # detection frame height
-FRAME_SEND_EVERY  = 5     # only send colour frames every N steps (reduces pipe traffic)
+FRAME_SEND_EVERY  = 5     # full-colour background frame (larger — keep throttled)
+DETECT_SEND_EVERY = 2     # detect frame (small — send more often to catch mid-climb)
 
 
 class DonkeyKongEnv:
@@ -63,7 +70,7 @@ class DonkeyKongEnv:
         )
 
         self.action_space_n = NUM_ACTIONS
-        self.observation_shape = (FRAME_STACK, FRAME_H, FRAME_W)
+        self.observation_shape = (OBS_CHANNELS, FRAME_H, FRAME_W)
 
         self._provide_frame  = provide_frame
         self._provide_detect = provide_detect
@@ -71,6 +78,9 @@ class DonkeyKongEnv:
         self._prev_lives    = 3
         self._prev_mario_y  = MARIO_Y_START
         self._step_count    = 0
+        self._prev_action   = 0
+        self._last_teal     = np.zeros((FRAME_H, FRAME_W), dtype=np.float32)
+        self._max_steps     = MAX_STEPS
 
     # ------------------------------------------------------------------
     # Public API
@@ -83,8 +93,10 @@ class DonkeyKongEnv:
         self._prev_lives   = 3
         self._prev_mario_y = MARIO_Y_START
         self._step_count   = 0
+        self._max_steps    = MAX_STEPS + random.randint(-200, 200)
 
         frame = self._preprocess(obs)
+        self._last_teal = self._extract_teal(obs)
         for _ in range(FRAME_STACK):
             self._frames.append(frame)
 
@@ -100,25 +112,32 @@ class DonkeyKongEnv:
         obs = raw_obs
 
         self._step_count += 1
+        self._last_teal = self._extract_teal(obs)
         self._frames.append(self._preprocess(obs))
 
         lives    = info.get('lives',    self._prev_lives)
-        mario_y  = info.get('mario_y',  self._prev_mario_y)
         gameover = info.get('gameover', 0)
+        mario_y  = self._detect_mario_y(obs)
 
-        reward, won = self._compute_reward(lives, mario_y, gameover)
+        barrel_penalty = self._barrel_proximity_penalty(obs, mario_y)
+        ladder_bonus   = self._ladder_climbing_bonus(obs, action_idx)
+        reward, won    = self._compute_reward(lives, mario_y, gameover)
+        reward += barrel_penalty + ladder_bonus
+        self._prev_action = action_idx
 
-        done = bool(gameover) or won or self._step_count >= MAX_STEPS
+        done = bool(gameover) or won or self._step_count >= self._max_steps
 
         self._prev_lives   = lives
         self._prev_mario_y = mario_y
+        info['_mario_y']   = mario_y
 
-        # Throttled colour frames for ghost viewer (avoids flooding the pipe)
-        if self._step_count % FRAME_SEND_EVERY == 0:
-            if self._provide_frame:
-                info['_raw_frame'] = obs   # full res for background display (env 0)
-            if self._provide_detect:
-                info['_detect_frame'] = cv2.resize(obs, (DETECT_W, DETECT_H))
+        # Full-res color frame for ghost viewer background — throttled to reduce pipe load
+        if self._provide_frame and self._step_count % FRAME_SEND_EVERY == 0:
+            info['_raw_frame'] = obs
+
+        # Detect frame — more frequent than background since it's small and used for height tracking
+        if self._provide_detect and self._step_count % DETECT_SEND_EVERY == 0:
+            info['_detect_frame'] = cv2.resize(obs, (DETECT_W, DETECT_H))
 
         return self._get_state(), reward, done, info
 
@@ -129,35 +148,136 @@ class DonkeyKongEnv:
     # Internals
     # ------------------------------------------------------------------
 
+    def _detect_mario_y(self, obs):
+        """
+        Detect Mario's Y position directly from the frame using colour detection.
+        Falls back to previous value if detection fails.
+        Uses skin (low-S) + blue overalls + red hat all adjacent — same as ghost viewer.
+        Operates on a small frame for speed.
+        """
+        small = cv2.resize(obs, (DETECT_W, DETECT_H))
+        sh, sw = small.shape[:2]
+        hsv = cv2.cvtColor(small, cv2.COLOR_RGB2HSV)
+
+        skin = cv2.inRange(hsv, np.array([  0,  45, 215]), np.array([ 12, 110, 255]))
+        blue = cv2.inRange(hsv, np.array([115, 230, 130]), np.array([125, 255, 210]))
+        red  = cv2.inRange(hsv, np.array([  0, 200, 180]), np.array([ 12, 255, 240]))
+
+        # Exclude HUD and DK zone
+        hud_cut = int(sh * 0.106)
+        skin[:hud_cut, :] = 0; blue[:hud_cut, :] = 0; red[:hud_cut, :] = 0
+        dy0, dy1 = int(sh * 0.078), int(sh * 0.254)
+        dx1 = int(sw * 0.322)
+        skin[dy0:dy1, :dx1] = 0; blue[dy0:dy1, :dx1] = 0; red[dy0:dy1, :dx1] = 0
+
+        k = np.ones((14, 14), np.uint8)
+        region = cv2.bitwise_and(cv2.dilate(skin, k),
+                 cv2.bitwise_and(cv2.dilate(blue, k), cv2.dilate(red, k)))
+        pixels = cv2.bitwise_and(skin, region)
+
+        ys, _ = np.where(pixels > 0)
+        if len(ys) < 2:
+            return self._prev_mario_y   # keep last known position
+
+        # Convert detect-frame y back to NES screen y (0-240)
+        mario_y_nes = int(np.median(ys) * 240 / sh)
+        return mario_y_nes
+
+    def _ladder_climbing_bonus(self, obs, action_idx):
+        """
+        Bonus for ladder interaction:
+        - +1.0 when pressing UP (action 3) near teal ladder pixels (actively climbing)
+        - +0.2 when pressing UP anywhere (encourage trying ladders)
+        - +0.1 when near a ladder (any action) to draw Mario toward them
+        """
+        h, w = obs.shape[:2]
+        region = obs[int(h * 0.1):, :]
+        hsv  = cv2.cvtColor(region, cv2.COLOR_RGB2HSV)
+        teal = cv2.inRange(hsv, np.array([83, 220, 190]), np.array([95, 255, 255]))
+        teal_count = cv2.countNonZero(teal)
+
+        if action_idx == 3:
+            if teal_count > 80:
+                return 1.0   # actively climbing a ladder
+            return 0.2       # pressing UP but no ladder visible
+        if teal_count > 80:
+            return 0.1       # near a ladder but not pressing UP
+        return 0.0
+
+    def _barrel_proximity_penalty(self, obs, mario_y):
+        """
+        Return a negative reward if a barrel is within ~15 NES pixels vertically
+        of Mario. Barrels detected by their orange/amber body colour (H=15-35).
+        Uses the raw RGB frame so no extra conversion needed.
+        """
+        h, w = obs.shape[:2]
+        hsv = cv2.cvtColor(obs, cv2.COLOR_RGB2HSV)
+        # Barrel orange body: sampled H=15,S=197,V=248
+        orange = cv2.inRange(hsv,
+                             np.array([10, 160, 220]),
+                             np.array([25, 215, 255]))
+        # Exclude DK zone (stacked barrels at top-left are not in play)
+        dk_y0 = int(h * 0.078);  dk_y1 = int(h * 0.254)
+        dk_x1 = int(w * 0.322)
+        orange[dk_y0:dk_y1, :dk_x1] = 0
+
+        ys, _ = np.where(orange > 0)
+        if len(ys) == 0:
+            return 0.0
+        # Convert pixel y → NES y coords (obs is 256×240)
+        barrel_nes_ys = ys * 240.0 / h
+        # Soft repulsive gradient: closer barrel = larger penalty
+        dists = np.abs(barrel_nes_ys - mario_y)
+        closest = dists.min() if len(dists) else 999
+        if closest < 15:
+            proximity_factor = 1.0 - (closest / 15.0)   # 1.0 when touching, 0.0 at edge
+            return -0.5 * proximity_factor
+        return 0.0
+
     def _preprocess(self, obs):
         gray = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
         resized = cv2.resize(gray, (FRAME_W, FRAME_H), interpolation=cv2.INTER_AREA)
         return resized.astype(np.float32) / 255.0
 
+    def _extract_teal(self, obs):
+        """Binary ladder channel: 1.0 where teal ladder pixels are, 0.0 elsewhere."""
+        hsv  = cv2.cvtColor(obs, cv2.COLOR_RGB2HSV)
+        teal = cv2.inRange(hsv, np.array([83, 220, 190]), np.array([95, 255, 255]))
+        resized = cv2.resize(teal, (FRAME_W, FRAME_H), interpolation=cv2.INTER_NEAREST)
+        return (resized > 0).astype(np.float32)
+
     def _get_state(self):
-        return np.array(self._frames, dtype=np.float32)
+        gray_stack = np.array(self._frames, dtype=np.float32)   # (4, H, W)
+        # Teal channel is static per-step; use the most recent raw frame via the last preprocess call.
+        # We rebuild it from the cached last frame stored during the last step/reset.
+        teal = self._last_teal[np.newaxis]                       # (1, H, W)
+        return np.concatenate([gray_stack, teal], axis=0)        # (5, H, W)
 
     def _compute_reward(self, lives, mario_y, gameover):
         reward = 0.0
 
-        # Height gained: Y decreases as Mario climbs (NES origin = top-left)
         dy = self._prev_mario_y - mario_y   # positive = climbed upward
-        reward += dy * 0.5
 
-        # Win: reached the top of the level
+        # Height reward scales with how high Mario already is:
+        # near bottom each pixel = 3pts, near top each pixel = 10pts
+        # creates a constant pull toward the top rather than local optima
+        height_progress = (MARIO_Y_START - mario_y) / TOTAL_HEIGHT  # 0.0 at bottom, 1.0 at top
+        climb_scale = 3.0 + height_progress * 7.0
+        reward += dy * climb_scale
+
+        # Win — the only real goal
         won = mario_y <= MARIO_Y_WIN
         if won:
-            reward += 100.0
+            reward += 500.0
 
-        # Time penalty — every step costs something, so faster = higher reward
-        reward -= 0.1
+        # Light time penalty — enough to discourage idling, not so harsh it punishes exploration
+        reward -= 0.3
 
-        # Death penalty
+        # Death: small penalty — risk-taking to climb should be acceptable
         if lives < self._prev_lives:
-            reward -= 15.0
+            reward -= 3.0
 
-        # Game over penalty
         if gameover:
-            reward -= 30.0
+            reward -= 5.0
 
         return reward, won

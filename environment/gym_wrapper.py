@@ -6,7 +6,7 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 
-from environment.donkey_kong_env import DonkeyKongEnv, NUM_ACTIONS, FRAME_STACK, FRAME_H, FRAME_W
+from environment.donkey_kong_env import DonkeyKongEnv, NUM_ACTIONS, OBS_CHANNELS, FRAME_H, FRAME_W
 
 
 class DonkeyKongGymEnv(gym.Env):
@@ -20,9 +20,10 @@ class DonkeyKongGymEnv(gym.Env):
                                   provide_frame=provide_frame, provide_detect=provide_detect)
         # Channels-first (C, H, W) — NatureCNN uses shape[0] as n_input_channels.
         # normalize_images=False is set in train_ppo so SB3 accepts float32 0-1.
+        # Channel 5 is the teal/ladder binary mask so the CNN can explicitly see ladders.
         self.observation_space = spaces.Box(
             low=0.0, high=1.0,
-            shape=(FRAME_STACK, FRAME_H, FRAME_W),
+            shape=(OBS_CHANNELS, FRAME_H, FRAME_W),
             dtype=np.float32,
         )
         self.action_space = spaces.Discrete(NUM_ACTIONS)

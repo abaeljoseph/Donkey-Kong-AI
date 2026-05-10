@@ -78,6 +78,7 @@ def train_ppo(
     total_timesteps: int = 1_000_000,
     num_envs: int        = 4,
     render: bool         = False,
+    use_arm: bool        = False,
     arm_gui: bool        = False,
     load_model: str      = None,
     eval_only: bool      = False,
@@ -89,14 +90,12 @@ def train_ppo(
     os.makedirs(save_dir, exist_ok=True)
 
     env_fns = [_make_env_fn(render=render, rank=i, ghost_viewer=ghost_viewer) for i in range(num_envs)]
-    # gym_wrapper already outputs (C,H,W) channels-first; normalize_images=False tells SB3
     vec_env = SubprocVecEnv(env_fns)
 
-    arm     = RobotArm(gui=arm_gui)
+    arm     = RobotArm(gui=arm_gui) if use_arm else None
     metrics = MetricsTracker()
 
     callbacks = [
-        ArmMirrorCallback(arm),
         MetricsCallback(metrics),
         CheckpointCallback(
             save_freq=max(save_freq // num_envs, 1),
@@ -104,6 +103,9 @@ def train_ppo(
             name_prefix='ppo',
         ),
     ]
+
+    if use_arm:
+        callbacks.append(ArmMirrorCallback(arm))
 
     if ghost_viewer:
         callbacks.append(GhostViewerCallback(num_envs=num_envs))
@@ -117,16 +119,16 @@ def train_ppo(
             env=vec_env,
             policy_kwargs=dict(normalize_images=False),
             learning_rate=2.5e-4,
-            n_steps=128,          # steps per env before each update
-            batch_size=256,
-            n_epochs=4,
+            n_steps=256,          # fewer steps = more frequent but shorter updates
+            batch_size=512,       # larger batch = better GPU utilisation
+            n_epochs=2,           # minimal epochs = shortest possible update pause
             gamma=0.99,
             gae_lambda=0.95,
             clip_range=0.1,
-            ent_coef=0.01,        # encourages exploration
+            ent_coef=0.05,        # higher entropy = more exploration to find ladders
             vf_coef=0.5,
             max_grad_norm=0.5,
-            verbose=1,
+            verbose=0,
             tensorboard_log=os.path.join(save_dir, 'tb_logs'),
         )
 
@@ -141,6 +143,7 @@ def train_ppo(
         print(f'Saved final model → {final_path}.zip')
 
     vec_env.close()
-    arm.close()
+    if arm:
+        arm.close()
 
     return metrics
