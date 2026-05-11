@@ -4,8 +4,35 @@ PPO-based AI agent that learns to play Donkey Kong (NES) using stable-baselines3
 
 ---
 
+## IMPORTANT — Run this in WSL (Windows Subsystem for Linux)
+
+**Do not run this natively on Windows.** gym-retro does not work properly on Windows. You must use WSL2.
+
+### Enable WSL2 (if not already set up)
+
+Open PowerShell as Administrator and run:
+```powershell
+wsl --install
+```
+Restart your PC when prompted. This installs Ubuntu by default.
+
+Once WSL is installed, open the **Ubuntu** app from the Start menu and run all commands below inside that terminal.
+
+### Clone the repo inside WSL
+
+```bash
+cd ~
+git clone <your-repo-url>
+cd "Donkey Kong AI"
+```
+
+> Do NOT work from `/mnt/c/...` (your Windows drive) — file I/O over the WSL bridge is slow. Clone directly into the Linux filesystem (`~/`).
+
+---
+
 ## Requirements
 
+- WSL2 with Ubuntu
 - Python 3.10 or 3.11
 - NVIDIA GPU recommended (RTX 4070 or similar) — AMD GPUs are not supported by PyTorch CUDA
 
@@ -33,9 +60,14 @@ pip install -r requirements.txt
 
 ### 3. ROM setup
 
-You need a Donkey Kong NES ROM. Place it in the project root with one of these names:
+You need a Donkey Kong NES ROM. Place it in the project root (inside WSL, e.g. `~/Donkey Kong AI/`) with one of these names:
 - `Donkey Kong (World) (Rev 1).nes`
 - `Donkey Kong.nes`
+
+To copy a file from Windows into WSL you can use:
+```bash
+cp /mnt/c/Users/YourName/Downloads/"Donkey Kong (World) (Rev 1).nes" ~/
+```
 
 Then run:
 ```bash
