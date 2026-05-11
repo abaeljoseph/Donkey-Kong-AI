@@ -11,10 +11,10 @@ import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback
 
 # Window is 3× NES resolution
-_NES_W, _NES_H = 256, 240
+_NES_W, _NES_H = 240, 224
 _SCALE          = 3
-_WIN_W          = _NES_W * _SCALE   # 768
-_WIN_H          = _NES_H * _SCALE   # 720
+_WIN_W          = _NES_W * _SCALE   # 720
+_WIN_H          = _NES_H * _SCALE   # 672
 
 _OBS_W = _OBS_H = 84   # preprocessed frame size
 
@@ -126,6 +126,43 @@ def _find_barrels_color(frame_rgb):
     return barrels
 
 
+# ── Fire detection ─────────────────────────────────────────────────────────────
+
+def _find_fires_color(frame_rgb):
+    """
+    Detect fires/fireballs by their bright red colour.
+    Fires in DK NES are brighter red than barrels (H≈0-8 vs barrel H≈10-25).
+    Returns list of (x, y) positions in frame pixel coords.
+
+    Tune with: python tools/debug_detection.py — click a fire pixel and read HSV.
+    """
+    if frame_rgb is None:
+        return []
+
+    h, w = frame_rgb.shape[:2]
+    hsv = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2HSV)
+
+    # Fire cream/low-saturation orange — sampled HSV=(18,82,248)
+    # Barrels are S=160+, Mario red is S=200+, fire sits at S=50-130
+    fire = cv2.inRange(hsv,
+                       np.array([ 12,  50, 220]),
+                       np.array([ 25, 130, 255]))
+
+    # Exclude HUD and DK zone
+    fire[:int(h * _HUD_Y), :] = 0
+    fire[int(h * _DK_Y0):int(h * _DK_Y1),
+         int(w * _DK_X0):int(w * _DK_X1)] = 0
+
+    n_labels, _, stats, centroids = cv2.connectedComponentsWithStats(fire, connectivity=8)
+    fires = []
+    for i in range(1, n_labels):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if 8 < area < 400:   # fires are smaller than barrels
+            cx, cy = centroids[i]
+            fires.append((int(cx), int(cy)))
+    return fires
+
+
 # ── Callback ───────────────────────────────────────────────────────────────────
 
 class GhostViewerCallback(BaseCallback):
@@ -229,6 +266,16 @@ class GhostViewerCallback(BaseCallback):
                 pg.draw.circle(self._screen, (0, 0, 0), (bx_win, by_win), 7, 2)
                 self._screen.blit(self._font_sm.render('B', True, (0, 0, 0)),
                                   (bx_win - 4, by_win - 6))
+
+        # ── Fire dots (from env 0 cached frame) ─────────────────────────
+        if self._cached_bg is not None:
+            for fx, fy in _find_fires_color(self._cached_bg):
+                fx_win = int(fx * _WIN_W / frame_w)
+                fy_win = int(fy * _WIN_H / frame_h)
+                pg.draw.circle(self._screen, (255, 30, 30), (fx_win, fy_win), 6)
+                pg.draw.circle(self._screen, (255, 255, 0), (fx_win, fy_win), 6, 2)
+                self._screen.blit(self._font_sm.render('F', True, (255, 255, 0)),
+                                  (fx_win - 4, fy_win - 6))
 
         # ── Ghost positions ──────────────────────────────────────────────
         for i in range(min(self._num_envs, len(infos))):

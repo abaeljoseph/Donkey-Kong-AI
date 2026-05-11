@@ -34,7 +34,9 @@ retro.data.Integrations.add_custom_path(INTEGRATION_PATH)
 SCALE    = 3
 NES_W, NES_H = 256, 240
 WIN_W, WIN_H = NES_W * SCALE, NES_H * SCALE
-BTN_NONE = [0] * 9
+BTN_NONE  = [0] * 9
+BTN_RIGHT = [0, 0, 0, 0, 0, 0, 0, 1, 0]   # walk right
+BTN_JUMP  = [0, 0, 0, 0, 0, 0, 0, 1, 1]   # jump right (to clear barrels)
 
 # Current zone values — edit these defaults or drag to set new ones
 hud_zone  = [0.0, 0.0, 1.0, 0.106]             # [x0, y0, x1, y1] as fractions
@@ -48,10 +50,11 @@ def capture_frame(advance=180):
         inttype=retro.data.Integrations.CUSTOM_ONLY,
     )
     obs, _ = env.reset()
-    for _ in range(advance):
-        obs, *_ = env.step(BTN_NONE)
+    info = {}
+    for i in range(advance):
+        obs, _, _, _, info = env.step(BTN_RIGHT)
     env.close()
-    return obs   # (H, W, 3) RGB uint8
+    return obs, info   # (H, W, 3) RGB uint8, info dict with RAM values
 
 
 def advance_existing(obs_initial, extra_frames):
@@ -112,6 +115,22 @@ def find_barrels(frame_rgb):
     return barrels
 
 
+def find_fires(frame_rgb):
+    h, w = frame_rgb.shape[:2]
+    hsv = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2HSV)
+    fire = cv2.inRange(hsv, np.array([12, 50, 220]), np.array([25, 130, 255]))
+    hy1 = int(hud_zone[3] * h)
+    fire[:hy1, :] = 0
+    fire[int(dk_zone[1] * h):int(dk_zone[3] * h),
+         int(dk_zone[0] * w):int(dk_zone[2] * w)] = 0
+    n, _, stats, centroids = cv2.connectedComponentsWithStats(fire, connectivity=8)
+    fires = []
+    for i in range(1, n):
+        if 8 < stats[i, cv2.CC_STAT_AREA] < 400:
+            fires.append((int(centroids[i][0]), int(centroids[i][1])))
+    return fires
+
+
 def draw_zone_overlay(screen, zone, color_rgba, label, font):
     x0, y0, x1, y1 = zone_to_px(zone, WIN_W, WIN_H)
     s = pygame.Surface((x1 - x0, y1 - y0), pygame.SRCALPHA)
@@ -121,7 +140,7 @@ def draw_zone_overlay(screen, zone, color_rgba, label, font):
     screen.blit(font.render(label, True, color_rgba[:3]), (x0 + 4, y0 + 4))
 
 
-def draw_scene(screen, frame_rgb, font, drag_mode, drag_rect, show_overlays, mouse_pos):
+def draw_scene(screen, frame_rgb, font, drag_mode, drag_rect, show_overlays, mouse_pos, ram_info=None):
     h, w = frame_rgb.shape[:2]
     scale_x = WIN_W / w
     scale_y = WIN_H / h
@@ -150,6 +169,15 @@ def draw_scene(screen, frame_rgb, font, drag_mode, drag_rect, show_overlays, mou
             pygame.draw.circle(screen, (255, 140, 0), (bx_w, by_w), 10)
             pygame.draw.circle(screen, (0, 0, 0), (bx_w, by_w), 10, 2)
             screen.blit(font.render('B', True, (0, 0, 0)), (bx_w - 5, by_w - 7))
+            screen.blit(font.render(f'({bx},{by})', True, (255, 200, 0)), (bx_w + 12, by_w - 7))
+
+        # Fire dots
+        fires = find_fires(frame_rgb)
+        for fx, fy in fires:
+            fx_w = int(fx * WIN_W / w);  fy_w = int(fy * WIN_H / h)
+            pygame.draw.circle(screen, (255, 30, 30), (fx_w, fy_w), 10)
+            pygame.draw.circle(screen, (255, 255, 0), (fx_w, fy_w), 10, 2)
+            screen.blit(font.render('F', True, (255, 255, 0)), (fx_w - 5, fy_w - 7))
 
         # Mario dot
         mario = find_mario(frame_rgb)
@@ -158,8 +186,10 @@ def draw_scene(screen, frame_rgb, font, drag_mode, drag_rect, show_overlays, mou
             pygame.draw.circle(screen, (0, 255, 80), (mx_w, my_w), 12)
             pygame.draw.circle(screen, (255,255,255), (mx_w, my_w), 12, 2)
             screen.blit(font.render('M', True, (0, 0, 0)), (mx_w - 5, my_w - 7))
+            screen.blit(font.render(f'({mario[0]},{mario[1]})', True, (0, 255, 80)), (mx_w + 14, my_w - 7))
     else:
         barrels = find_barrels(frame_rgb)
+        fires   = find_fires(frame_rgb)
         mario   = find_mario(frame_rgb)
 
     # Crosshair on cursor pixel (snapped to NES grid)
@@ -180,9 +210,13 @@ def draw_scene(screen, frame_rgb, font, drag_mode, drag_rect, show_overlays, mou
         hsv = cv2.cvtColor(np.array([[[r, g, b]]], dtype=np.uint8), cv2.COLOR_RGB2HSV)[0,0]
         cursor_str = f'  |  ({cpx},{cpy}) RGB=({r},{g},{b}) HSV=({hsv[0]},{hsv[1]},{hsv[2]})'
 
+    color_y   = mario[1] if mario else '?'
+    color_x   = mario[0] if mario else '?'
+    mario_str = f'Mario: ({color_x},{color_y})  lives={ram_info.get("lives","?") if ram_info else "?"}'
+
     overlay_str = '[Z] overlays ON' if show_overlays else '[Z] overlays OFF — click raw pixels'
     mode_str    = f'[{drag_mode}] drag to draw' if drag_mode else 'H=HUD  D=DK  P=print  F=+60fr  R=restart  Q=quit'
-    status      = f'Barrels:{len(barrels)}  Mario:{"YES" if mario else "NO"}  {overlay_str}  {mode_str}{cursor_str}'
+    status      = f'Barrels:{len(barrels)}  Fires:{len(fires)}  {mario_str}  {overlay_str}  {mode_str}{cursor_str}'
     screen.blit(font.render(status, True, (0,0,0)),       (7, WIN_H - 19))
     screen.blit(font.render(status, True, (220,220,220)), (6, WIN_H - 20))
 
@@ -209,9 +243,10 @@ def main():
 
     total_advance = 180
     print(f'Capturing frame (advance={total_advance} frames)...')
-    frame = capture_frame(total_advance)
+    frame, ram_info = capture_frame(total_advance)
     frame_hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
     print(f'Frame: {frame.shape[1]}×{frame.shape[0]}  (scale_x={WIN_W/frame.shape[1]:.3f} scale_y={WIN_H/frame.shape[0]:.3f})')
+    print(f'RAM values: mario_y={ram_info.get("mario_y","?")}  mario_x={ram_info.get("mario_x","?")}  lives={ram_info.get("lives","?")}  gameover={ram_info.get("gameover","?")}')
 
     drag_mode     = None    # 'H' or 'D'
     drag_start    = None
@@ -222,7 +257,7 @@ def main():
 
     running = True
     while running:
-        draw_scene(screen, frame, font, drag_mode, drag_rect, show_overlays, mouse_pos)
+        draw_scene(screen, frame, font, drag_mode, drag_rect, show_overlays, mouse_pos, ram_info)
         clock.tick(30)
 
         for event in pygame.event.get():
@@ -251,14 +286,18 @@ def main():
                     print_zones()
                 elif event.key == pygame.K_f:
                     total_advance += 60
-                    print(f'Advancing to {total_advance} frames...')
-                    frame = capture_frame(total_advance)
+                    frame, ram_info = capture_frame(total_advance)
                     frame_hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
+                    mario = find_mario(frame)
+                    color_y = mario[1] if mario else '?'
+                    color_x = mario[0] if mario else '?'
+                    print(f'frame={total_advance:5d}  RAM=({ram_info.get("mario_x","?"):>3},{ram_info.get("mario_y","?"):>3})  COLOR=({color_x},{color_y})  lives={ram_info.get("lives","?")}')
                 elif event.key == pygame.K_r:
                     total_advance = 180
                     print('Recapturing from start...')
-                    frame = capture_frame(total_advance)
+                    frame, ram_info = capture_frame(total_advance)
                     frame_hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
+                    print(f'RAM values: mario_y={ram_info.get("mario_y","?")}  mario_x={ram_info.get("mario_x","?")}  lives={ram_info.get("lives","?")}')
 
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 if drag_mode:

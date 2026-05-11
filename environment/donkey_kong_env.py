@@ -26,12 +26,12 @@ DISCRETE_ACTIONS = [
 ]
 NUM_ACTIONS = len(DISCRETE_ACTIONS)
 
-FRAME_H     = 84
-FRAME_W     = 84
-FRAME_STACK = 4
-OBS_CHANNELS = 5    # 4 grayscale + 1 teal/ladder channel
-FRAME_SKIP  = 8      # hold each action for N frames
-MAX_STEPS   = 1200   # decision steps per episode (randomised ±200 per env to stagger resets)
+FRAME_H      = 84
+FRAME_W      = 84
+FRAME_STACK  = 4
+OBS_CHANNELS = 7    # 4 grayscale + teal/ladder + barrel + fire
+FRAME_SKIP   = 8    # hold each action for N frames
+MAX_STEPS    = 1200 # decision steps per episode (randomised ±200 per env to stagger resets)
 
 # Donkey Kong NES level 1: Mario starts near Y=176, princess is near Y=22.
 # Y decreases as Mario climbs (NES screen origin is top-left).
@@ -80,7 +80,10 @@ class DonkeyKongEnv:
         self._step_count    = 0
         self._prev_action   = 0
         self._last_teal     = np.zeros((FRAME_H, FRAME_W), dtype=np.float32)
+        self._last_barrel   = np.zeros((FRAME_H, FRAME_W), dtype=np.float32)
+        self._last_fire     = np.zeros((FRAME_H, FRAME_W), dtype=np.float32)
         self._max_steps     = MAX_STEPS
+        self._reset_mario_y = MARIO_Y_START
 
     # ------------------------------------------------------------------
     # Public API
@@ -95,8 +98,22 @@ class DonkeyKongEnv:
         self._step_count   = 0
         self._max_steps    = MAX_STEPS + random.randint(-200, 200)
 
-        frame = self._preprocess(obs)
-        self._last_teal = self._extract_teal(obs)
+        h, w      = obs.shape[:2]
+        hsv       = cv2.cvtColor(obs, cv2.COLOR_RGB2HSV)
+        gray      = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
+        small     = cv2.resize(obs, (DETECT_W, DETECT_H))
+        small_hsv = cv2.cvtColor(small, cv2.COLOR_RGB2HSV)
+        sh, sw    = small.shape[:2]
+
+        # Detect actual starting Y so the first step doesn't get a spurious height penalty
+        # from the mismatch between hardcoded MARIO_Y_START and true detected position (~210).
+        self._prev_mario_y  = self._detect_mario_y(small_hsv, sh, sw)
+        self._reset_mario_y = self._prev_mario_y
+
+        frame = self._preprocess_gray(gray)
+        self._last_teal   = self._extract_teal(hsv)
+        self._last_barrel = self._extract_barrel(hsv, h, w)
+        self._last_fire   = self._extract_fire(hsv, h, w)
         for _ in range(FRAME_STACK):
             self._frames.append(frame)
 
@@ -112,17 +129,32 @@ class DonkeyKongEnv:
         obs = raw_obs
 
         self._step_count += 1
-        self._last_teal = self._extract_teal(obs)
-        self._frames.append(self._preprocess(obs))
+
+        # Precompute colour conversions once — shared by all detection and extraction methods.
+        # Previously each method did its own cvtColor; this eliminates 6 redundant conversions
+        # and 1 redundant resize per step.
+        h, w      = obs.shape[:2]
+        hsv       = cv2.cvtColor(obs, cv2.COLOR_RGB2HSV)
+        gray      = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
+        small     = cv2.resize(obs, (DETECT_W, DETECT_H))
+        small_hsv = cv2.cvtColor(small, cv2.COLOR_RGB2HSV)
+        sh, sw    = small.shape[:2]
+
+        self._last_teal   = self._extract_teal(hsv)
+        self._last_barrel = self._extract_barrel(hsv, h, w)
+        self._last_fire   = self._extract_fire(hsv, h, w)
+        self._frames.append(self._preprocess_gray(gray))
 
         lives    = info.get('lives',    self._prev_lives)
         gameover = info.get('gameover', 0)
-        mario_y  = self._detect_mario_y(obs)
+        mario_y  = self._detect_mario_y(small_hsv, sh, sw)
 
-        barrel_penalty = self._barrel_proximity_penalty(obs, mario_y)
-        ladder_bonus   = self._ladder_climbing_bonus(obs, action_idx)
+        barrel_penalty = self._barrel_proximity_penalty(hsv, mario_y, h)
+        fire_penalty   = self._fire_proximity_penalty(hsv, mario_y, h)
+        dy_this_step   = self._prev_mario_y - mario_y   # positive = moved up this step
+        ladder_bonus   = self._ladder_climbing_bonus(hsv, action_idx, h, dy_this_step)
         reward, won    = self._compute_reward(lives, mario_y, gameover)
-        reward += barrel_penalty + ladder_bonus
+        reward += barrel_penalty + fire_penalty + ladder_bonus
         self._prev_action = action_idx
 
         done = bool(gameover) or won or self._step_count >= self._max_steps
@@ -135,9 +167,9 @@ class DonkeyKongEnv:
         if self._provide_frame and self._step_count % FRAME_SEND_EVERY == 0:
             info['_raw_frame'] = obs
 
-        # Detect frame — more frequent than background since it's small and used for height tracking
+        # Reuse the already-resized small frame — no second resize needed
         if self._provide_detect and self._step_count % DETECT_SEND_EVERY == 0:
-            info['_detect_frame'] = cv2.resize(obs, (DETECT_W, DETECT_H))
+            info['_detect_frame'] = small
 
         return self._get_state(), reward, done, info
 
@@ -148,20 +180,15 @@ class DonkeyKongEnv:
     # Internals
     # ------------------------------------------------------------------
 
-    def _detect_mario_y(self, obs):
+    def _detect_mario_y(self, small_hsv, sh, sw):
         """
-        Detect Mario's Y position directly from the frame using colour detection.
+        Detect Mario's Y position from a precomputed small HSV frame.
         Falls back to previous value if detection fails.
         Uses skin (low-S) + blue overalls + red hat all adjacent — same as ghost viewer.
-        Operates on a small frame for speed.
         """
-        small = cv2.resize(obs, (DETECT_W, DETECT_H))
-        sh, sw = small.shape[:2]
-        hsv = cv2.cvtColor(small, cv2.COLOR_RGB2HSV)
-
-        skin = cv2.inRange(hsv, np.array([  0,  45, 215]), np.array([ 12, 110, 255]))
-        blue = cv2.inRange(hsv, np.array([115, 230, 130]), np.array([125, 255, 210]))
-        red  = cv2.inRange(hsv, np.array([  0, 200, 180]), np.array([ 12, 255, 240]))
+        skin = cv2.inRange(small_hsv, np.array([  0,  45, 215]), np.array([ 12, 110, 255]))
+        blue = cv2.inRange(small_hsv, np.array([115, 230, 130]), np.array([125, 255, 210]))
+        red  = cv2.inRange(small_hsv, np.array([  0, 200, 180]), np.array([ 12, 255, 240]))
 
         # Exclude HUD and DK zone
         hud_cut = int(sh * 0.106)
@@ -180,38 +207,33 @@ class DonkeyKongEnv:
             return self._prev_mario_y   # keep last known position
 
         # Convert detect-frame y back to NES screen y (0-240)
-        mario_y_nes = int(np.median(ys) * 240 / sh)
+        mario_y_nes = int(np.median(ys) * 224 / sh)
         return mario_y_nes
 
-    def _ladder_climbing_bonus(self, obs, action_idx):
+    def _ladder_climbing_bonus(self, hsv, action_idx, h, dy):
         """
-        Bonus for ladder interaction:
-        - +1.0 when pressing UP (action 3) near teal ladder pixels (actively climbing)
-        - +0.2 when pressing UP anywhere (encourage trying ladders)
-        - +0.1 when near a ladder (any action) to draw Mario toward them
+        Bonus for ladder interaction.
+        The UP+teal bonus only fires when Mario is actually moving upward (dy > 0)
+        to prevent reward hacking by spamming UP at the base of a ladder.
+        The passive near-ladder reward draws Mario toward ladders without being farmable.
         """
-        h, w = obs.shape[:2]
-        region = obs[int(h * 0.1):, :]
-        hsv  = cv2.cvtColor(region, cv2.COLOR_RGB2HSV)
-        teal = cv2.inRange(hsv, np.array([83, 220, 190]), np.array([95, 255, 255]))
+        region_hsv = hsv[int(h * 0.1):, :]
+        teal = cv2.inRange(region_hsv, np.array([83, 220, 190]), np.array([95, 255, 255]))
         teal_count = cv2.countNonZero(teal)
 
-        if action_idx == 3:
-            if teal_count > 80:
-                return 1.0   # actively climbing a ladder
-            return 0.2       # pressing UP but no ladder visible
+        if action_idx == 3 and dy > 0 and teal_count > 80:
+            return 3.0   # pressing UP, near ladder, AND actually moving up
         if teal_count > 80:
-            return 0.1       # near a ladder but not pressing UP
+            return 0.3   # near a ladder — draw Mario toward it
         return 0.0
 
-    def _barrel_proximity_penalty(self, obs, mario_y):
+    def _barrel_proximity_penalty(self, hsv, mario_y, h):
         """
         Return a negative reward if a barrel is within ~15 NES pixels vertically
         of Mario. Barrels detected by their orange/amber body colour (H=15-35).
         Uses the raw RGB frame so no extra conversion needed.
         """
-        h, w = obs.shape[:2]
-        hsv = cv2.cvtColor(obs, cv2.COLOR_RGB2HSV)
+        w = hsv.shape[1]
         # Barrel orange body: sampled H=15,S=197,V=248
         orange = cv2.inRange(hsv,
                              np.array([10, 160, 220]),
@@ -225,33 +247,73 @@ class DonkeyKongEnv:
         if len(ys) == 0:
             return 0.0
         # Convert pixel y → NES y coords (obs is 256×240)
-        barrel_nes_ys = ys * 240.0 / h
+        barrel_nes_ys = ys * 224.0 / h
         # Soft repulsive gradient: closer barrel = larger penalty
         dists = np.abs(barrel_nes_ys - mario_y)
         closest = dists.min() if len(dists) else 999
         if closest < 15:
             proximity_factor = 1.0 - (closest / 15.0)   # 1.0 when touching, 0.0 at edge
-            return -0.5 * proximity_factor
+            return -0.2 * proximity_factor
         return 0.0
 
-    def _preprocess(self, obs):
-        gray = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
+    def _fire_proximity_penalty(self, hsv, mario_y, h):
+        """
+        Penalty when a fire/fireball is within ~20 NES pixels of Mario.
+        Fire cream/low-saturation orange: H=12-25, S=50-130 (unique vs barrels S=160+).
+        Tune HSV range using: python tools/debug_detection.py — click a fire pixel.
+        """
+        w = hsv.shape[1]
+        # Fire cream/low-saturation orange — sampled HSV=(18,82,248)
+        fire = cv2.inRange(hsv,
+                           np.array([ 12,  50, 220]),
+                           np.array([ 25, 130, 255]))
+        dk_y0 = int(h * 0.078);  dk_y1 = int(h * 0.254)
+        dk_x1 = int(w * 0.322)
+        fire[dk_y0:dk_y1, :dk_x1] = 0
+
+        ys, _ = np.where(fire > 0)
+        if len(ys) == 0:
+            return 0.0
+        fire_nes_ys  = ys * 224.0 / h
+        dists        = np.abs(fire_nes_ys - mario_y)
+        closest      = dists.min()
+        if closest < 20:
+            return -0.2 * (1.0 - closest / 20.0)
+        return 0.0
+
+    def _preprocess_gray(self, gray):
         resized = cv2.resize(gray, (FRAME_W, FRAME_H), interpolation=cv2.INTER_AREA)
         return resized.astype(np.float32) / 255.0
 
-    def _extract_teal(self, obs):
-        """Binary ladder channel: 1.0 where teal ladder pixels are, 0.0 elsewhere."""
-        hsv  = cv2.cvtColor(obs, cv2.COLOR_RGB2HSV)
-        teal = cv2.inRange(hsv, np.array([83, 220, 190]), np.array([95, 255, 255]))
-        resized = cv2.resize(teal, (FRAME_W, FRAME_H), interpolation=cv2.INTER_NEAREST)
+    def _extract_teal(self, hsv):
+        """Binary ladder channel: 1.0 where teal ladder pixels are."""
+        mask = cv2.inRange(hsv, np.array([83, 220, 190]), np.array([95, 255, 255]))
+        resized = cv2.resize(mask, (FRAME_W, FRAME_H), interpolation=cv2.INTER_NEAREST)
+        return (resized > 0).astype(np.float32)
+
+    def _extract_barrel(self, hsv, h, w):
+        """Binary barrel channel: 1.0 where barrel orange pixels are."""
+        mask = cv2.inRange(hsv, np.array([10, 160, 220]), np.array([25, 215, 255]))
+        # Exclude DK zone (stacked barrels at top-left are not in play)
+        dk_y0 = int(h * 0.078); dk_y1 = int(h * 0.254); dk_x1 = int(w * 0.322)
+        mask[dk_y0:dk_y1, :dk_x1] = 0
+        resized = cv2.resize(mask, (FRAME_W, FRAME_H), interpolation=cv2.INTER_NEAREST)
+        return (resized > 0).astype(np.float32)
+
+    def _extract_fire(self, hsv, h, w):
+        """Binary fire channel: 1.0 where fire/fireball pixels are."""
+        mask = cv2.inRange(hsv, np.array([12, 50, 220]), np.array([25, 130, 255]))
+        dk_y0 = int(h * 0.078); dk_y1 = int(h * 0.254); dk_x1 = int(w * 0.322)
+        mask[dk_y0:dk_y1, :dk_x1] = 0
+        resized = cv2.resize(mask, (FRAME_W, FRAME_H), interpolation=cv2.INTER_NEAREST)
         return (resized > 0).astype(np.float32)
 
     def _get_state(self):
         gray_stack = np.array(self._frames, dtype=np.float32)   # (4, H, W)
-        # Teal channel is static per-step; use the most recent raw frame via the last preprocess call.
-        # We rebuild it from the cached last frame stored during the last step/reset.
-        teal = self._last_teal[np.newaxis]                       # (1, H, W)
-        return np.concatenate([gray_stack, teal], axis=0)        # (5, H, W)
+        teal   = self._last_teal  [np.newaxis]                   # (1, H, W) ladders
+        barrel = self._last_barrel[np.newaxis]                   # (1, H, W) barrels
+        fire   = self._last_fire  [np.newaxis]                   # (1, H, W) fires
+        return np.concatenate([gray_stack, teal, barrel, fire], axis=0)  # (7, H, W)
 
     def _compute_reward(self, lives, mario_y, gameover):
         reward = 0.0
@@ -261,7 +323,7 @@ class DonkeyKongEnv:
         # Height reward scales with how high Mario already is:
         # near bottom each pixel = 3pts, near top each pixel = 10pts
         # creates a constant pull toward the top rather than local optima
-        height_progress = (MARIO_Y_START - mario_y) / TOTAL_HEIGHT  # 0.0 at bottom, 1.0 at top
+        height_progress = max(0.0, min(1.0, (self._reset_mario_y - mario_y) / TOTAL_HEIGHT))
         climb_scale = 3.0 + height_progress * 7.0
         reward += dy * climb_scale
 
@@ -270,8 +332,8 @@ class DonkeyKongEnv:
         if won:
             reward += 500.0
 
-        # Light time penalty — enough to discourage idling, not so harsh it punishes exploration
-        reward -= 0.3
+        # Tiny time penalty — just enough to discourage standing still, not enough to punish exploration
+        reward -= 0.05
 
         # Death: small penalty — risk-taking to climb should be acceptable
         if lives < self._prev_lives:

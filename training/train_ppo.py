@@ -52,6 +52,37 @@ class ArmMirrorCallback(BaseCallback):
         return True
 
 
+class HeightCallback(BaseCallback):
+    """Logs Mario's height climbed per episode to TensorBoard, per env and as a mean."""
+
+    def __init__(self, num_envs: int, verbose=0):
+        super().__init__(verbose)
+        self._num_envs   = num_envs
+        self._ep_best_y  = [999] * num_envs
+        self._ep_start_y = [None] * num_envs
+
+    def _on_step(self) -> bool:
+        infos = self.locals.get('infos', [])
+        dones = self.locals.get('dones', [])
+
+        for i, (info, done) in enumerate(zip(infos, dones)):
+            mario_y = info.get('_mario_y')
+            if mario_y is not None:
+                if self._ep_start_y[i] is None:
+                    self._ep_start_y[i] = mario_y
+                if mario_y < self._ep_best_y[i]:
+                    self._ep_best_y[i] = mario_y
+
+            if done and self._ep_start_y[i] is not None:
+                height_px = max(0, self._ep_start_y[i] - self._ep_best_y[i])
+                self.logger.record_mean(f'height/env_{i:02d}', height_px)
+                self.logger.record_mean('height/mean', height_px)
+                self._ep_best_y[i]  = 999
+                self._ep_start_y[i] = None
+
+        return True
+
+
 class MetricsCallback(BaseCallback):
     """Collects per-episode reward/steps/deaths into MetricsTracker."""
 
@@ -97,6 +128,7 @@ def train_ppo(
 
     callbacks = [
         MetricsCallback(metrics),
+        HeightCallback(num_envs=num_envs),
         CheckpointCallback(
             save_freq=max(save_freq // num_envs, 1),
             save_path=save_dir,
