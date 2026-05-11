@@ -4,7 +4,7 @@ PPO-based AI agent that learns to play Donkey Kong (NES) using stable-baselines3
 
 ---
 
-## IMPORTANT — Run this in WSL (Windows Subsystem for Linux)
+## ⚠ IMPORTANT — Run this in WSL (Windows Subsystem for Linux) ⚠
 
 **Do not run this natively on Windows.** gym-retro does not work properly on Windows. You must use WSL2.
 
