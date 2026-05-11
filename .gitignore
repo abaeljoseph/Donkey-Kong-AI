@@ -16,5 +16,5 @@ __pycache__/
 # retro SHA (generated locally by setup_rom.py)
 retro_data/*/rom.sha
 
-.venv312/
+.venv/
 stable-retro-src/

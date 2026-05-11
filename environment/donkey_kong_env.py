@@ -30,8 +30,8 @@ FRAME_H     = 84
 FRAME_W     = 84
 FRAME_STACK = 4
 OBS_CHANNELS = 5    # 4 grayscale + 1 teal/ladder channel
-FRAME_SKIP  = 8      # hold each action for N frames
-MAX_STEPS   = 1200   # decision steps per episode (randomised ±200 per env to stagger resets)
+FRAME_SKIP  = 4      # hold each action for N frames
+MAX_STEPS   = 2400   # decision steps per episode (randomised ±200 per env to stagger resets)
 
 # Donkey Kong NES level 1: Mario starts near Y=176, princess is near Y=22.
 # Y decreases as Mario climbs (NES screen origin is top-left).
@@ -90,6 +90,11 @@ class DonkeyKongEnv:
         result = self.env.reset()
         obs = result[0] if isinstance(result, tuple) else result
 
+        # Auto-advance Mario to the right to trigger fireballs
+        for _ in range(180):
+            result = self.env.step(DISCRETE_ACTIONS[2])  # action 2 = RIGHT
+            obs = result[0]
+
         self._prev_lives   = 3
         self._prev_mario_y = MARIO_Y_START
         self._step_count   = 0
@@ -120,9 +125,10 @@ class DonkeyKongEnv:
         mario_y  = self._detect_mario_y(obs)
 
         barrel_penalty = self._barrel_proximity_penalty(obs, mario_y)
+        fireball_penalty = self._fireball_proximity_penalty(obs, mario_y)
         ladder_bonus   = self._ladder_climbing_bonus(obs, action_idx)
         reward, won    = self._compute_reward(lives, mario_y, gameover)
-        reward += barrel_penalty + ladder_bonus
+        reward += barrel_penalty + fireball_penalty + ladder_bonus
         self._prev_action = action_idx
 
         done = bool(gameover) or won or self._step_count >= self._max_steps
@@ -232,6 +238,32 @@ class DonkeyKongEnv:
         if closest < 15:
             proximity_factor = 1.0 - (closest / 15.0)   # 1.0 when touching, 0.0 at edge
             return -0.5 * proximity_factor
+        return 0.0
+
+    def _fireball_proximity_penalty(self, obs, mario_y):
+        """
+        Return a negative reward if a fireball is within ~15 NES pixels vertically
+        of Mario. Fireballs detected by orange/yellow colour (H=18,S=82,V=248).
+        """
+        h, w = obs.shape[:2]
+        hsv = cv2.cvtColor(obs, cv2.COLOR_RGB2HSV)
+        orange = cv2.inRange(hsv, np.array([12, 60, 200]), np.array([24, 150, 255]))
+        # Exclude HUD and DK zone
+        hud_y = int(h * 0.106)
+        orange[:hud_y, :] = 0
+        dk_y0 = int(h * 0.078);  dk_y1 = int(h * 0.254)
+        dk_x1 = int(w * 0.322)
+        orange[dk_y0:dk_y1, :dk_x1] = 0
+
+        ys, _ = np.where(orange > 0)
+        if len(ys) == 0:
+            return 0.0
+        fireball_nes_ys = ys * 240.0 / h
+        dists = np.abs(fireball_nes_ys - mario_y)
+        closest = dists.min() if len(dists) else 999
+        if closest < 15:
+            proximity_factor = 1.0 - (closest / 15.0)
+            return -1.2 * proximity_factor
         return 0.0
 
     def _preprocess(self, obs):

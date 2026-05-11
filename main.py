@@ -35,7 +35,7 @@ def parse_args():
     p.add_argument('--ppo-save-freq', type=int, default=50_000,    help='PPO: checkpoint every N steps')
     p.add_argument('--no-ghost',      action='store_true',          help='Disable ghost viewer window')
     # Shared
-    p.add_argument('--num-envs',    type=int,   default=8,   help='Parallel environments')
+    p.add_argument('--num-envs',    type=int,   default=24,  help='Parallel environments')
     p.add_argument('--render',      action='store_true', help='Render game window (env 0 only)')
     p.add_argument('--arm',         action='store_true', help='Enable PyBullet robot arm')
     p.add_argument('--arm-gui',     action='store_true', help='Show PyBullet arm GUI (implies --arm)')

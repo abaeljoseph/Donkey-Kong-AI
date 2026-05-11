@@ -48,8 +48,9 @@ def capture_frame(advance=180):
         inttype=retro.data.Integrations.CUSTOM_ONLY,
     )
     obs, _ = env.reset()
+    right_action = [0, 0, 0, 0, 0, 0, 0, 1, 0]  # RIGHT
     for _ in range(advance):
-        obs, *_ = env.step(BTN_NONE)
+        obs, *_ = env.step(right_action)
     env.close()
     return obs   # (H, W, 3) RGB uint8
 
@@ -112,6 +113,24 @@ def find_barrels(frame_rgb):
     return barrels
 
 
+def find_fireballs(frame_rgb):
+    h, w = frame_rgb.shape[:2]
+    hsv = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2HSV)
+    # Fireball orange/yellow: sampled H=18,S=82,V=248
+    orange = cv2.inRange(hsv, np.array([12, 60, 200]), np.array([24, 150, 255]))
+    # Exclude HUD and DK zone
+    hy1 = int(hud_zone[3] * h)
+    orange[:hy1, :] = 0
+    orange[int(dk_zone[1] * h):int(dk_zone[3] * h),
+           int(dk_zone[0] * w):int(dk_zone[2] * w)] = 0
+    n, _, stats, centroids = cv2.connectedComponentsWithStats(orange, connectivity=8)
+    fireballs = []
+    for i in range(1, n):
+        if 10 < stats[i, cv2.CC_STAT_AREA] < 500:
+            fireballs.append((int(centroids[i][0]), int(centroids[i][1])))
+    return fireballs
+
+
 def draw_zone_overlay(screen, zone, color_rgba, label, font):
     x0, y0, x1, y1 = zone_to_px(zone, WIN_W, WIN_H)
     s = pygame.Surface((x1 - x0, y1 - y0), pygame.SRCALPHA)
@@ -151,6 +170,14 @@ def draw_scene(screen, frame_rgb, font, drag_mode, drag_rect, show_overlays, mou
             pygame.draw.circle(screen, (0, 0, 0), (bx_w, by_w), 10, 2)
             screen.blit(font.render('B', True, (0, 0, 0)), (bx_w - 5, by_w - 7))
 
+        # Fireball dots
+        fireballs = find_fireballs(frame_rgb)
+        for fx, fy in fireballs:
+            fx_w = int(fx * WIN_W / w);  fy_w = int(fy * WIN_H / h)
+            pygame.draw.circle(screen, (255, 50, 50), (fx_w, fy_w), 10)
+            pygame.draw.circle(screen, (0, 0, 0), (fx_w, fy_w), 10, 2)
+            screen.blit(font.render('F', True, (0, 0, 0)), (fx_w - 5, fy_w - 7))
+
         # Mario dot
         mario = find_mario(frame_rgb)
         if mario:
@@ -160,6 +187,7 @@ def draw_scene(screen, frame_rgb, font, drag_mode, drag_rect, show_overlays, mou
             screen.blit(font.render('M', True, (0, 0, 0)), (mx_w - 5, my_w - 7))
     else:
         barrels = find_barrels(frame_rgb)
+        fireballs = find_fireballs(frame_rgb)
         mario   = find_mario(frame_rgb)
 
     # Crosshair on cursor pixel (snapped to NES grid)
@@ -182,7 +210,7 @@ def draw_scene(screen, frame_rgb, font, drag_mode, drag_rect, show_overlays, mou
 
     overlay_str = '[Z] overlays ON' if show_overlays else '[Z] overlays OFF — click raw pixels'
     mode_str    = f'[{drag_mode}] drag to draw' if drag_mode else 'H=HUD  D=DK  P=print  F=+60fr  R=restart  Q=quit'
-    status      = f'Barrels:{len(barrels)}  Mario:{"YES" if mario else "NO"}  {overlay_str}  {mode_str}{cursor_str}'
+    status      = f'Barrels:{len(barrels)}  Fireballs:{len(fireballs)}  Mario:{"YES" if mario else "NO"}  {overlay_str}  {mode_str}{cursor_str}'
     screen.blit(font.render(status, True, (0,0,0)),       (7, WIN_H - 19))
     screen.blit(font.render(status, True, (220,220,220)), (6, WIN_H - 20))
 
