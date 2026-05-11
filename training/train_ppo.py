@@ -132,7 +132,47 @@ def train_ppo(
             tensorboard_log=os.path.join(save_dir, 'tb_logs'),
         )
 
-    if not eval_only:
+    if eval_only:
+        # NES Y thresholds for each platform (Y decreases going up)
+        PLATFORMS = [
+            (999, 195, 'Platform 1 (ground)'),
+            (195, 160, 'Platform 2'),
+            (160, 125, 'Platform 3'),
+            (125,  90, 'Platform 4'),
+            ( 90,  55, 'Platform 5'),
+            ( 55,  30, 'Platform 6 (top)'),
+            (  30,   0, 'WIN — reached Pauline!'),
+        ]
+
+        def platform_name(mario_y):
+            for y_low, y_high, name in PLATFORMS:
+                if mario_y < y_low:
+                    return name
+            return 'unknown'
+
+        print('Running evaluation — press Ctrl+C to stop.')
+        print(f'  {"ep":>4}  {"reward":>8}  {"best height":>20}  note')
+        obs = vec_env.reset()
+        ep_count, ep_reward, ep_best_y = 0, 0.0, 999
+        best_ever_y, best_ever_ep = 999, 0
+        while True:
+            action, _ = model.predict(obs, deterministic=False)
+            obs, rewards, dones, infos = vec_env.step(action)
+            ep_reward += float(rewards[0])
+            mario_y = infos[0].get('_mario_y', 999)
+            if mario_y < ep_best_y:
+                ep_best_y = mario_y
+            if dones[0]:
+                ep_count += 1
+                plat = platform_name(ep_best_y)
+                note = '*** NEW BEST ***' if ep_best_y < best_ever_y else ''
+                if ep_best_y < best_ever_y:
+                    best_ever_y, best_ever_ep = ep_best_y, ep_count
+                print(f'  {ep_count:4d}  {ep_reward:8.1f}  {plat:>20}  {note}')
+                metrics.log_episode(reward=ep_reward, steps=0, deaths=0, loss=0.0, eps=0.0)
+                ep_reward, ep_best_y = 0.0, 999
+
+    else:
         model.learn(
             total_timesteps=total_timesteps,
             callback=callbacks,
