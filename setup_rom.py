@@ -12,8 +12,11 @@ import shutil
 import sys
 
 
-ROM_FILENAME = 'Donkey Kong (World) (Rev 1).nes'
-GAME_NAME    = 'DonkeyKong-Nes'
+ROM_CANDIDATES = [
+    'Donkey Kong (World) (Rev 1).nes',
+    'Donkey Kong.nes',
+]
+GAME_NAME = 'DonkeyKong-Nes'
 
 
 def sha1(path: str) -> str:
@@ -27,11 +30,19 @@ def find_retro_data_path() -> str:
 
 
 def import_rom():
-    rom_path = os.path.join(os.path.dirname(__file__), ROM_FILENAME)
-    if not os.path.exists(rom_path):
-        print(f'ERROR: ROM not found at:\n  {rom_path}')
-        print(f'Place "{ROM_FILENAME}" in the project directory.')
+    project_dir = os.path.dirname(__file__)
+    rom_path = None
+    for candidate in ROM_CANDIDATES:
+        path = os.path.join(project_dir, candidate)
+        if os.path.exists(path):
+            rom_path = path
+            break
+    if rom_path is None:
+        print(f'ERROR: ROM not found. Place one of these files in the project directory:')
+        for c in ROM_CANDIDATES:
+            print(f'  {c}')
         sys.exit(1)
+    print(f'Found ROM: {os.path.basename(rom_path)}')
 
     integration_dir = os.path.join(
         os.path.dirname(__file__), 'retro_data', GAME_NAME

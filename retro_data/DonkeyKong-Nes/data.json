@@ -1,0 +1,9 @@
+{
+  "info": {
+    "lives":    { "address": 85, "type": "|u1" },
+    "gameover": { "address": 78, "type": "|u1" },
+    "score":    { "address": 36, "type": ">d4" },
+    "mario_x":  { "address": 67, "type": "|u1" },
+    "mario_y":  { "address": 46, "type": "|u1" }
+  }
+}

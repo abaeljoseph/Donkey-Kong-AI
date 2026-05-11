@@ -5,7 +5,7 @@
 saved_models/
 results/
 *.pt
-*.json
+results/*.json
 
 # Python
 __pycache__/
