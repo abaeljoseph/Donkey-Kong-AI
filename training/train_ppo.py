@@ -11,11 +11,18 @@ Run via main.py:
 
 import os
 import numpy as np
+import torch
 
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import SubprocVecEnv
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
 from stable_baselines3.common.monitor import Monitor
+
+
+def linear_schedule(initial: float):
+    def _fn(progress_remaining: float) -> float:
+        return progress_remaining * initial
+    return _fn
 
 from environment.gym_wrapper import DonkeyKongGymEnv
 from environment.ghost_viewer import GhostViewerCallback
@@ -120,8 +127,17 @@ def train_ppo(
 
     os.makedirs(save_dir, exist_ok=True)
 
+    torch.backends.cudnn.benchmark = True
+
     env_fns = [_make_env_fn(render=render, rank=i, ghost_viewer=ghost_viewer) for i in range(num_envs)]
-    vec_env = SubprocVecEnv(env_fns)
+    raw_env = SubprocVecEnv(env_fns)
+
+    vecnorm_path = os.path.join(save_dir, 'vecnorm.pkl')
+    if load_model and os.path.exists(vecnorm_path):
+        vec_env = VecNormalize.load(vecnorm_path, raw_env)
+        vec_env.training = True
+    else:
+        vec_env = VecNormalize(raw_env, norm_obs=False, norm_reward=True, clip_reward=10.0)
 
     arm     = RobotArm(gui=arm_gui) if use_arm else None
     metrics = MetricsTracker()
@@ -149,18 +165,22 @@ def train_ppo(
         model = PPO(
             policy='CnnPolicy',
             env=vec_env,
-            policy_kwargs=dict(normalize_images=False),
-            learning_rate=2.5e-4,
-            n_steps=256,          # fewer steps = more frequent but shorter updates
-            batch_size=512,       # larger batch = better GPU utilisation
-            n_epochs=2,           # minimal epochs = shortest possible update pause
+            device='cuda',
+            policy_kwargs=dict(
+                normalize_images=False,
+                features_extractor_kwargs=dict(features_dim=512),
+            ),
+            learning_rate=linear_schedule(3e-4),
+            n_steps=512,
+            batch_size=2048,
+            n_epochs=4,
             gamma=0.99,
             gae_lambda=0.95,
-            clip_range=0.1,
-            ent_coef=0.05,        # higher entropy = more exploration to find ladders
+            clip_range=0.2,
+            ent_coef=0.05,
             vf_coef=0.5,
             max_grad_norm=0.5,
-            verbose=0,
+            verbose=1,
             tensorboard_log=os.path.join(save_dir, 'tb_logs'),
         )
 
@@ -212,6 +232,7 @@ def train_ppo(
         )
         final_path = os.path.join(save_dir, 'ppo_final')
         model.save(final_path)
+        vec_env.save(vecnorm_path)
         print(f'Saved final model → {final_path}.zip')
 
     vec_env.close()
