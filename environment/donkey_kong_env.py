@@ -41,6 +41,12 @@ MARIO_Y_WIN   = 30   # reaching this Y or lower = level complete
 
 TOTAL_HEIGHT = MARIO_Y_START - MARIO_Y_WIN   # ~146 NES pixels, full climb distance
 
+# NES Y thresholds where a platform checkpoint is saved (Y decreases going up).
+# One slot per platform — saved the first time Mario safely crosses each boundary.
+PLATFORM_THRESHOLDS = [175, 140, 105, 70]   # platforms 2, 3, 4, 5
+# Reset sampling weights: [ground, plat2, plat3, plat4, plat5]
+CHECKPOINT_WEIGHTS  = [0.20, 0.15, 0.20, 0.25, 0.20]
+
 # Ghost viewer frame settings
 DETECT_W          = 160   # detection frame width  (half NES res, keeps Mario ≥3 skin px)
 DETECT_H          = 150   # detection frame height
@@ -84,9 +90,9 @@ class DonkeyKongEnv:
         self._last_barrel   = np.zeros((FRAME_H, FRAME_W), dtype=np.float32)
         self._last_fire     = np.zeros((FRAME_H, FRAME_W), dtype=np.float32)
         self._max_steps     = MAX_STEPS
-        self._reset_mario_y = MARIO_Y_START
-        self._best_y        = MARIO_Y_START   # best height reached (lower Y = higher up)
-        self._best_state    = None            # emulator snapshot at that height
+        self._reset_mario_y    = MARIO_Y_START
+        self._best_y           = MARIO_Y_START   # best height reached (lower Y = higher up)
+        self._platform_states  = [None] * len(PLATFORM_THRESHOLDS)   # checkpoint per platform
 
     # ------------------------------------------------------------------
     # Public API
@@ -96,10 +102,18 @@ class DonkeyKongEnv:
         result = self.env.reset()
         obs = result[0] if isinstance(result, tuple) else result
 
-        # 30% of the time resume from the best frontier state so the agent
-        # gets more practice near the highest point it has already reached.
-        if self._best_state is not None and self._best_y < MARIO_Y_START - 30 and random.random() < 0.3:
-            self.env.em.set_state(self._best_state)
+        # Sample a checkpoint to start from — weighted toward higher platforms so the
+        # agent drills every transition, not just the hardest one it barely reached.
+        pool    = [(None, CHECKPOINT_WEIGHTS[0])]   # ground / fresh start always available
+        for state, weight in zip(self._platform_states, CHECKPOINT_WEIGHTS[1:]):
+            if state is not None:
+                pool.append((state, weight))
+        states  = [s for s, _ in pool]
+        weights = [w for _, w in pool]
+        total   = sum(weights)
+        chosen  = random.choices(states, [w / total for w in weights], k=1)[0]
+        if chosen is not None:
+            self.env.em.set_state(chosen)
             result = self.env.step([0, 0, 0, 0, 0, 0, 0, 0, 0])   # NOOP to get obs
             obs = result[0]
 
@@ -174,7 +188,12 @@ class DonkeyKongEnv:
         if mario_y < self._best_y and lives >= self._prev_lives and not gameover:
             self._best_y = mario_y
             if self._is_safe_to_checkpoint(hsv, mario_y, h):
-                self._best_state = self.env.em.get_state()
+                state = None
+                for i, threshold in enumerate(PLATFORM_THRESHOLDS):
+                    if mario_y < threshold and self._platform_states[i] is None:
+                        if state is None:
+                            state = self.env.em.get_state()   # call get_state once
+                        self._platform_states[i] = state
         height_mult   = 1.0 if (action_idx not in JUMP_ACTIONS or danger_nearby) else 0.0
 
         reward, won = self._compute_reward(lives, mario_y, gameover, height_mult)
@@ -378,13 +397,13 @@ class DonkeyKongEnv:
         climb_scale = 3.0 + height_progress * 7.0
         reward += dy * climb_scale * height_mult
 
-        # Win — the only real goal
+        # Win — bonus scales with how fast Mario finished
         won = mario_y <= MARIO_Y_WIN
         if won:
-            reward += 500.0
+            reward += 500.0 + (self._max_steps - self._step_count) * 0.5
 
-        # Tiny time penalty — just enough to discourage standing still, not enough to punish exploration
-        reward -= 0.05
+        # Time penalty — discourages idling and hesitation
+        reward -= 0.1
 
         # Death: small penalty — risk-taking to climb should be acceptable
         if lives < self._prev_lives:
