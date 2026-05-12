@@ -24,7 +24,8 @@ DISCRETE_ACTIONS = [
     [0, 0, 0, 0, 0, 0, 1, 0, 1],   # 6: JUMP + LEFT  (A + LEFT)
     [0, 0, 0, 0, 0, 0, 0, 1, 1],   # 7: JUMP + RIGHT (A + RIGHT)
 ]
-NUM_ACTIONS = len(DISCRETE_ACTIONS)
+NUM_ACTIONS  = len(DISCRETE_ACTIONS)
+JUMP_ACTIONS = frozenset({5, 6, 7})   # JUMP, JUMP+LEFT, JUMP+RIGHT
 
 FRAME_H      = 84
 FRAME_W      = 84
@@ -84,6 +85,8 @@ class DonkeyKongEnv:
         self._last_fire     = np.zeros((FRAME_H, FRAME_W), dtype=np.float32)
         self._max_steps     = MAX_STEPS
         self._reset_mario_y = MARIO_Y_START
+        self._best_y        = MARIO_Y_START   # best height reached (lower Y = higher up)
+        self._best_state    = None            # emulator snapshot at that height
 
     # ------------------------------------------------------------------
     # Public API
@@ -92,6 +95,13 @@ class DonkeyKongEnv:
     def reset(self):
         result = self.env.reset()
         obs = result[0] if isinstance(result, tuple) else result
+
+        # 30% of the time resume from the best frontier state so the agent
+        # gets more practice near the highest point it has already reached.
+        if self._best_state is not None and self._best_y < MARIO_Y_START - 30 and random.random() < 0.3:
+            self.env.em.set_state(self._best_state)
+            result = self.env.step([0, 0, 0, 0, 0, 0, 0, 0, 0])   # NOOP to get obs
+            obs = result[0]
 
         self._prev_lives   = 3
         self._prev_mario_y = MARIO_Y_START
@@ -153,8 +163,24 @@ class DonkeyKongEnv:
         fire_penalty   = self._fire_proximity_penalty(hsv, mario_y, h)
         dy_this_step   = self._prev_mario_y - mario_y   # positive = moved up this step
         ladder_bonus   = self._ladder_climbing_bonus(hsv, action_idx, h, dy_this_step)
-        reward, won    = self._compute_reward(lives, mario_y, gameover)
+
+        # Jump is only useful for dodging — suppress height reward and penalise
+        # pointless jumping when no barrel or fire is nearby.
+        danger_nearby = barrel_penalty < -0.01 or fire_penalty < -0.01
+
+        # New height record — save checkpoint only if obstacles are far enough away
+        # that Mario has time to react when this state is loaded. get_state() is only
+        # called here (infrequent) not every step.
+        if mario_y < self._best_y and lives >= self._prev_lives and not gameover:
+            self._best_y = mario_y
+            if self._is_safe_to_checkpoint(hsv, mario_y, h):
+                self._best_state = self.env.em.get_state()
+        height_mult   = 1.0 if (action_idx not in JUMP_ACTIONS or danger_nearby) else 0.0
+
+        reward, won = self._compute_reward(lives, mario_y, gameover, height_mult)
         reward += barrel_penalty + fire_penalty + ladder_bonus
+        if action_idx in JUMP_ACTIONS and not danger_nearby:
+            reward -= 0.15   # active penalty for pointless jumping
         self._prev_action = action_idx
 
         done = bool(gameover) or won or self._step_count >= self._max_steps
@@ -315,17 +341,42 @@ class DonkeyKongEnv:
         fire   = self._last_fire  [np.newaxis]                   # (1, H, W) fires
         return np.concatenate([gray_stack, teal, barrel, fire], axis=0)  # (7, H, W)
 
-    def _compute_reward(self, lives, mario_y, gameover):
+    def _is_safe_to_checkpoint(self, hsv, mario_y, h):
+        """
+        Returns True if no barrel or fire is within a safe distance of Mario.
+        Uses a larger radius than the penalty threshold so Mario has reaction time
+        when the checkpoint is loaded. Only called when a new height record is set.
+        """
+        w = hsv.shape[1]
+        dk_y0 = int(h * 0.078); dk_y1 = int(h * 0.254); dk_x1 = int(w * 0.322)
+
+        orange = cv2.inRange(hsv, np.array([10, 160, 220]), np.array([25, 215, 255]))
+        orange[dk_y0:dk_y1, :dk_x1] = 0
+        ys, _ = np.where(orange > 0)
+        if len(ys) > 0:
+            if np.abs(ys * 224.0 / h - mario_y).min() < 40:
+                return False
+
+        fire = cv2.inRange(hsv, np.array([12, 50, 220]), np.array([25, 130, 255]))
+        fire[dk_y0:dk_y1, :dk_x1] = 0
+        ys, _ = np.where(fire > 0)
+        if len(ys) > 0:
+            if np.abs(ys * 224.0 / h - mario_y).min() < 50:
+                return False
+
+        return True
+
+    def _compute_reward(self, lives, mario_y, gameover, height_mult=1.0):
         reward = 0.0
 
         dy = self._prev_mario_y - mario_y   # positive = climbed upward
 
         # Height reward scales with how high Mario already is:
         # near bottom each pixel = 3pts, near top each pixel = 10pts
-        # creates a constant pull toward the top rather than local optima
+        # height_mult = 0 suppresses this for pointless jumps (no danger nearby)
         height_progress = max(0.0, min(1.0, (self._reset_mario_y - mario_y) / TOTAL_HEIGHT))
         climb_scale = 3.0 + height_progress * 7.0
-        reward += dy * climb_scale
+        reward += dy * climb_scale * height_mult
 
         # Win — the only real goal
         won = mario_y <= MARIO_Y_WIN

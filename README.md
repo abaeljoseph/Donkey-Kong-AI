@@ -118,20 +118,33 @@ This registers the ROM with the emulator and checks everything loads correctly. 
 ## Step 8 — Train the AI
 
 ```bash
-python main.py --algo ppo --timesteps 5000000
+python main.py --algo ppo --timesteps 10000000 --no-ghost --num-envs 8
 ```
 
-This starts training across 8 parallel game environments. A ghost viewer window will open showing all agents playing in real time.
+This starts training across 8 parallel game environments. Use `--no-ghost` for faster training (recommended for overnight runs).
+
+Check how many CPU cores you have and set `--num-envs` to match for maximum speed:
+```bash
+nproc
+```
+
+To train with the ghost viewer (slower but shows agents playing live):
+```bash
+python main.py --algo ppo --timesteps 10000000 --num-envs 8
+```
 
 To continue training from a saved checkpoint:
 ```bash
-python main.py --algo ppo --timesteps 5000000 --load-model saved_models/ppo_final
+python main.py --algo ppo --timesteps 10000000 --no-ghost --load-model saved_models/ppo_final
 ```
 
-To train without the ghost viewer (faster, good for overnight):
+**If you have an NVIDIA GPU** (e.g. RTX 4070), edit `training/train_ppo.py` and change `device='cpu'` to `device='cuda'` for 10–20× faster training. You can also increase `--num-envs` to 24 or more.
+
+To monitor training progress in real time, open a second terminal and run:
 ```bash
-python main.py --algo ppo --timesteps 5000000 --no-ghost
+tensorboard --logdir saved_models/tb_logs
 ```
+Then open `http://localhost:6006` in your browser. Watch `height/mean` — you want it trending upward over time.
 
 ---
 
@@ -190,22 +203,35 @@ python tools/debug_detection.py
 
 The agent watches the screen and decides what button to press every 8 game frames.
 
-**What it sees:** 4 stacked greyscale frames (84×84 pixels) + a 5th channel showing where the ladders are (highlighted in teal). This gives the CNN both motion context and explicit ladder awareness.
+**What it sees:** 7 channels total (84×84 pixels each):
+- 4 stacked greyscale frames — motion and layout context
+- 1 teal/ladder channel — exact positions of all climbable ladders
+- 1 barrel channel — exact positions of rolling barrels
+- 1 fire channel — exact positions of fireballs
+
+This gives the CNN explicit spatial awareness of every danger and every ladder on screen, not just greyscale blobs.
 
 **What it can do:** 8 actions — do nothing, left, right, up (climb ladder), down, jump, jump+left, jump+right.
 
-**How it learns:** PPO collects experience from 8 parallel games, then stops to update the network every 256 steps per environment. The reward function guides it:
+**How it learns:** PPO collects experience from 8 parallel games, then updates the network every 512 steps per environment. Rewards are normalised for stable training. The reward function guides it:
 
 | Situation | Reward |
 |---|---|
 | Climbing upward | +3 to +10 per NES pixel (scales higher near the top) |
-| Climbing a ladder (pressing Up near teal) | +1.0 |
-| Near a ladder | +0.1 |
-| Barrel within 15 pixels | up to -0.5 |
-| Each step taken | -0.3 (discourages idling) |
-| Death | -3.0 |
-| Game over | -5.0 |
+| Actively climbing a ladder (Up + moving up + near teal) | +3.0 |
+| Near a ladder | +0.3 |
+| Jumping over a barrel or fire | normal height reward |
+| Jumping with no danger nearby | 0 height reward, −0.5 penalty |
+| Barrel within 15 pixels | up to −0.2 |
+| Fire within 20 pixels | up to −0.2 |
+| Each step taken | −0.05 (discourages idling) |
+| Death | −3.0 |
+| Game over | −5.0 |
 | Winning (reaching Pauline) | +500 |
+
+**Frontier checkpoints:** When Mario reaches a new height record and no danger is nearby, the emulator state is saved. 30% of future episodes start from that saved position, giving the agent concentrated practice at the highest point it has reached rather than always climbing from scratch.
+
+**Reward hacking prevention:** The ladder climbing bonus only fires when Mario is actually moving upward — pressing UP while standing still at the base of a ladder gives no bonus.
 
 ---
 
@@ -244,5 +270,7 @@ saved_models/          # Where checkpoints are saved during training
 
 - The ROM is not in this repo — you must provide your own copy
 - Saved models are not committed to git — share `.zip` files manually
-- At least 5 million timesteps recommended before the agent starts climbing consistently
-- GPU training is 10–20x faster than CPU
+- At least 10 million timesteps recommended before the agent starts climbing consistently
+- GPU training (NVIDIA only) is 10–20× faster than CPU — change `device='cpu'` to `device='cuda'` in `training/train_ppo.py`
+- Old saved models (trained before 7-channel observations were added) are incompatible — delete them before retraining
+- If `height/mean` in TensorBoard is flat after 300k steps, the reward signal may need tuning — check `environment/donkey_kong_env.py`

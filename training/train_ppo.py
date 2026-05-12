@@ -165,7 +165,7 @@ def train_ppo(
         model = PPO(
             policy='CnnPolicy',
             env=vec_env,
-            device='cuda',
+            device='cpu',
             policy_kwargs=dict(
                 normalize_images=False,
                 features_extractor_kwargs=dict(features_dim=512),
@@ -180,7 +180,7 @@ def train_ppo(
             ent_coef=0.05,
             vf_coef=0.5,
             max_grad_norm=0.5,
-            verbose=1,
+            verbose=0,
             tensorboard_log=os.path.join(save_dir, 'tb_logs'),
         )
 
