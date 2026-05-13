@@ -272,8 +272,7 @@ This gives the CNN explicit spatial awareness of every danger and every ladder o
 | Situation | Reward |
 |---|---|
 | Climbing upward | +3 to +10 per NES pixel (scales higher near the top) |
-| Actively climbing a ladder (Up + moving up + near teal) | +3.0 |
-| Near a ladder | +0.3 |
+| Actively climbing an intact ladder (Up + moving up + teal immediately above) | +3.0 |
 | Jumping when a barrel or fire is nearby | normal height reward |
 | Jumping with no danger nearby | 0 height reward, −0.15 penalty |
 | Barrel within 15 pixels | up to −0.2 |
@@ -285,7 +284,7 @@ This gives the CNN explicit spatial awareness of every danger and every ladder o
 
 **Platform checkpoints:** The first time Mario safely reaches each platform, the emulator state is saved. Future episodes are distributed across all saved platforms — weighted toward higher ones — so the agent gets concentrated practice at every transition rather than always climbing from scratch. This also means it drills barrel patterns at each height repeatedly until they become reliable.
 
-**Reward hacking prevention:** The ladder climbing bonus only fires when Mario is actually moving upward — pressing UP while standing still at the base of a ladder gives no bonus.
+**Broken ladder detection:** The ladder climbing bonus checks for teal pixels within 20px immediately above Mario before firing. Broken ladders have a gap at entry level so no teal is detected there — the bonus is suppressed and Mario has no incentive to stay. Mario can still physically use broken ladder sections to dodge obstacles, he just gets no climbing reward from them. The near-ladder proximity bonus was removed entirely as it caused repeated reward hacking regardless of whether the ladder was intact.
 
 ---
 

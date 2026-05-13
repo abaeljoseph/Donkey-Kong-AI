@@ -11,8 +11,7 @@ import cv2
 import retro
 
 
-# NES button layout in stable-retro: B, NULL, SELECT, START, UP, DOWN, LEFT, RIGHT, A
-# NES button layout: [B, NULL, SELECT, START, UP, DOWN, LEFT, RIGHT, A]
+# NES button layout in stable-retro: [B, NULL, SELECT, START, UP, DOWN, LEFT, RIGHT, A]
 # In NES Donkey Kong, A button (index 8) is jump — B does nothing.
 DISCRETE_ACTIONS = [
     [0, 0, 0, 0, 0, 0, 0, 0, 0],   # 0: NOOP
@@ -85,12 +84,10 @@ class DonkeyKongEnv:
         self._prev_lives    = 3
         self._prev_mario_y  = MARIO_Y_START
         self._step_count    = 0
-        self._prev_action   = 0
         self._last_teal     = np.zeros((FRAME_H, FRAME_W), dtype=np.float32)
         self._last_barrel   = np.zeros((FRAME_H, FRAME_W), dtype=np.float32)
         self._last_fire     = np.zeros((FRAME_H, FRAME_W), dtype=np.float32)
         self._max_steps     = MAX_STEPS
-        self._stuck_steps   = 0
         self._reset_mario_y    = MARIO_Y_START
         self._best_y           = MARIO_Y_START   # best height reached (lower Y = higher up)
         self._platform_states  = [None] * len(PLATFORM_THRESHOLDS)   # checkpoint per platform
@@ -121,7 +118,6 @@ class DonkeyKongEnv:
         self._prev_lives   = 3
         self._prev_mario_y = MARIO_Y_START
         self._step_count   = 0
-        self._stuck_steps  = 0
         self._max_steps    = MAX_STEPS + random.randint(-200, 200)
 
         h, w      = obs.shape[:2]
@@ -178,7 +174,7 @@ class DonkeyKongEnv:
         barrel_penalty = self._barrel_proximity_penalty(hsv, mario_y, h)
         fire_penalty   = self._fire_proximity_penalty(hsv, mario_y, h)
         dy_this_step   = self._prev_mario_y - mario_y   # positive = moved up this step
-        ladder_bonus   = self._ladder_climbing_bonus(hsv, action_idx, h, dy_this_step)
+        ladder_bonus   = self._ladder_climbing_bonus(hsv, action_idx, mario_y, h, dy_this_step)
 
         # Jump is only useful for dodging — suppress height reward and penalise
         # pointless jumping when no barrel or fire is nearby.
@@ -202,7 +198,6 @@ class DonkeyKongEnv:
         reward += barrel_penalty + fire_penalty + ladder_bonus
         if action_idx in JUMP_ACTIONS and not danger_nearby:
             reward -= 0.15   # active penalty for pointless jumping
-        self._prev_action = action_idx
 
         done = bool(gameover) or won or self._step_count >= self._max_steps
 
@@ -257,21 +252,28 @@ class DonkeyKongEnv:
         mario_y_nes = int(np.median(ys) * 224 / sh)
         return mario_y_nes
 
-    def _ladder_climbing_bonus(self, hsv, action_idx, h, dy):
+    def _ladder_climbing_bonus(self, hsv, action_idx, mario_y, h, dy):
         """
-        Bonus for ladder interaction.
-        The UP+teal bonus only fires when Mario is actually moving upward (dy > 0)
-        to prevent reward hacking by spamming UP at the base of a ladder.
-        The passive near-ladder reward draws Mario toward ladders without being farmable.
+        +3.0 bonus for actively climbing an intact ladder.
+        Requires pressing UP, moving upward, and teal pixels present — AND
+        checks that teal exists above Mario in a 40px window so broken ladder
+        sections (no teal above the gap) give no bonus.
+        Mario can still physically use broken ladders to dodge obstacles,
+        he just gets no climbing reward for them.
         """
-        region_hsv = hsv[int(h * 0.1):, :]
+        hud_offset = int(h * 0.1)
+        region_hsv = hsv[hud_offset:, :]
         teal = cv2.inRange(region_hsv, np.array([83, 220, 190]), np.array([95, 255, 255]))
-        teal_count = cv2.countNonZero(teal)
 
-        if action_idx == 3 and dy > 0 and teal_count > 80:
-            return 3.0   # pressing UP, near ladder, AND actually moving up
-        if teal_count > 80:
-            return 0.3   # near a ladder — draw Mario toward it
+        if action_idx == 3 and dy > 0 and cv2.countNonZero(teal) > 80:
+            mario_y_px = int(mario_y * h / 224) - hud_offset
+            # Check only 2–20px above Mario — working ladder rails are immediately
+            # adjacent, broken ladder teal starts above the gap further up.
+            above_top  = max(0, mario_y_px - 20)
+            above_bot  = max(0, mario_y_px - 2)
+            teal_above = cv2.countNonZero(teal[above_top:above_bot, :]) if above_bot > above_top else 0
+            if teal_above >= 5:
+                return 3.0   # intact ladder immediately above — reward climbing
         return 0.0
 
     def _barrel_proximity_penalty(self, hsv, mario_y, h):
@@ -293,7 +295,7 @@ class DonkeyKongEnv:
         ys, _ = np.where(orange > 0)
         if len(ys) == 0:
             return 0.0
-        # Convert pixel y → NES y coords (obs is 256×240)
+        # Convert pixel y → NES y coords (frame is 240×224)
         barrel_nes_ys = ys * 224.0 / h
         # Soft repulsive gradient: closer barrel = larger penalty
         dists = np.abs(barrel_nes_ys - mario_y)

@@ -4,25 +4,18 @@ Uses SubprocVecEnv from SB3 for parallel data collection (more sample-efficient
 than DQN and easier to parallelise with SB3's built-in vec env support).
 
 Run via main.py:
-    python main.py --algo ppo --timesteps 1000000
-    python main.py --algo ppo --timesteps 500000 --render
-    python main.py --algo ppo --timesteps 0 --load-model saved_models/ppo_final --eval-only
+    python main.py --algo ppo --timesteps 10000000 --no-ghost --num-envs 8
+    python main.py --algo ppo --timesteps 10000000 --load-model saved_models/ppo_XXXXXX_steps --no-ghost --num-envs 8
+    python main.py --algo ppo --eval-only --load-model saved_models/ppo_final --render --num-envs 1
 """
 
 import os
-import numpy as np
 import torch
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
 from stable_baselines3.common.monitor import Monitor
-
-
-def linear_schedule(initial: float):
-    def _fn(progress_remaining: float) -> float:
-        return progress_remaining * initial
-    return _fn
 
 from environment.gym_wrapper import DonkeyKongGymEnv
 from environment.ghost_viewer import GhostViewerCallback
@@ -171,7 +164,7 @@ def train_ppo(
                 normalize_images=False,
                 features_extractor_kwargs=dict(features_dim=512),
             ),
-            learning_rate=linear_schedule(3e-4),
+            learning_rate=3e-4,
             n_steps=512,
             batch_size=2048,
             n_epochs=4,
