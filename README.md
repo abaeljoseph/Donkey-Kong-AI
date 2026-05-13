@@ -88,19 +88,17 @@ This installs everything the project needs including:
 
 You need a Donkey Kong NES ROM file. The ROM is not included in this repo (copyright).
 
-1. Get a file named either:
-   - `Donkey Kong (World) (Rev 1).nes`
-   - `Donkey Kong.nes`
+1. Get a file named: `Donkey Kong.nes`
 
 2. Copy it from Windows into WSL:
    ```bash
-   cp /mnt/c/Users/YourName/Downloads/"Donkey Kong (World) (Rev 1).nes" ~/
+   cp /mnt/c/Users/YourName/Downloads/"Donkey Kong.nes" ~/
    ```
    Replace `YourName` with your actual Windows username.
 
 3. Move it into the project folder:
    ```bash
-   mv "Donkey Kong (World) (Rev 1).nes" ~/"Donkey Kong AI"/
+   mv "Donkey Kong.nes" ~/"Donkey Kong AI"/
    ```
 
 ---
@@ -115,40 +113,70 @@ This registers the ROM with the emulator and checks everything loads correctly. 
 
 ---
 
-## Step 8 — Train the AI
+## Step 8 — Activate the virtual environment
 
+Every time you open a new WSL terminal, run this before any other command:
+```bash
+source .venv/bin/activate
+```
+
+You should see `(.venv)` appear at the start of your prompt. If you skip this, Python will not find the installed packages.
+
+---
+
+## Step 9 — Train the AI
+
+**Recommended — fast training, no visualiser (best for overnight runs):**
 ```bash
 python main.py --algo ppo --timesteps 10000000 --no-ghost --num-envs 8
 ```
 
-This starts training across 8 parallel game environments. Use `--no-ghost` for faster training (recommended for overnight runs).
-
-Check how many CPU cores you have and set `--num-envs` to match for maximum speed:
-```bash
-nproc
-```
-
-To train with the ghost viewer (slower but shows agents playing live):
+**With live ghost viewer (slower, but lets you watch agents play):**
 ```bash
 python main.py --algo ppo --timesteps 10000000 --num-envs 8
 ```
 
-To continue training from a saved checkpoint:
+**Continue training from a saved checkpoint:**
 ```bash
-python main.py --algo ppo --timesteps 10000000 --no-ghost --load-model saved_models/ppo_final
+python main.py --algo ppo --timesteps 10000000 --no-ghost --load-model saved_models/ppo_XXXXXX_steps
+```
+Replace `ppo_XXXXXX_steps` with the filename of your latest checkpoint (without `.zip`). To find it:
+```bash
+ls saved_models/ppo_*.zip | sort -V | tail -3
 ```
 
-**If you have an NVIDIA GPU** (e.g. RTX 4070), edit `training/train_ppo.py` and change `device='cpu'` to `device='cuda'` for 10–20× faster training. You can also increase `--num-envs` to 24 or more.
+**Choosing how many environments (`--num-envs`):**
 
-To monitor training progress in real time, open a second terminal and run:
+More environments = more game data collected at once, but each environment needs a CPU core. Running more environments than you have cores slows everything down.
+
+Check how many cores your CPU has:
 ```bash
-tensorboard --logdir saved_models/tb_logs
+nproc
 ```
-Then open `http://localhost:6006` in your browser. Watch `height/mean` — you want it trending upward over time.
+Set `--num-envs` to that number. 8 is a safe default for most machines.
+
+**NVIDIA GPU users (e.g. RTX 4070):**
+Edit `training/train_ppo.py` and change `device='cpu'` to `device='cuda'` for 10–20× faster training. You can also increase `--num-envs` to match your core count (e.g. `--num-envs 12`).
 
 ---
 
-## Step 9 — Watch the trained model play
+## Step 10 — Monitor training progress
+
+Open a second WSL terminal and run:
+```bash
+tensorboard --logdir saved_models/tb_logs
+```
+Then open `http://localhost:6006` in your browser.
+
+**What to watch:**
+- `height/mean` — how high Mario is climbing on average. You want this trending upward over time.
+- **Smoothed** value (shown in TensorBoard) is more reliable than the raw **Value** — the raw value is noisy and jumps around. Always judge progress by the smoothed line.
+
+TensorBoard data is saved to disk continuously during training. You can close and reopen it at any time — all history will still be there.
+
+---
+
+## Step 11 — Watch the trained model play
 
 ```bash
 python main.py --algo ppo --eval-only --load-model saved_models/ppo_final --render --num-envs 1
@@ -160,7 +188,7 @@ This opens the game window and shows the AI playing. Each episode prints the rew
 
 ## Ghost Viewer — what you're looking at
 
-The ghost viewer window opens automatically during training.
+The ghost viewer window opens automatically during training (omit `--no-ghost` to enable it).
 
 | What you see | What it means |
 |---|---|
@@ -180,22 +208,48 @@ The height chart has two panels:
 
 ---
 
-## Debug tool — tune detection
+## Debug tool — tune colour detection
 
-If Mario or barrels are being detected incorrectly, run this interactive tool:
+If Mario, barrels, or fire are being detected incorrectly (wrong positions, missing detections, false positives), use this interactive tool to inspect and tune the HSV colour ranges:
+
 ```bash
 python tools/debug_detection.py
 ```
 
-| Key | What it does |
+The tool opens a window showing the game frame with all detections overlaid. Use it to click pixels, draw exclusion zones, and verify that the right objects are being picked up.
+
+### Controls
+
+| Key / Action | What it does |
 |---|---|
-| H then drag | Draw the HUD exclusion zone |
-| D then drag | Draw the DK exclusion zone |
-| Z | Toggle overlays on/off to see raw colours |
-| P | Print zone values to paste into code |
-| F | Advance 60 more game frames |
-| R | Reset back to the start |
-| Click | Print the RGB and HSV colour of that pixel |
+| **Click** on a pixel | Prints that pixel's RGB and HSV values to the terminal — use this to sample colours for tuning detection ranges |
+| **H** then drag | Draw the HUD exclusion zone (top strip with score display — ignored by the AI) |
+| **D** then drag | Draw the DK zone (top-left area where Donkey Kong stands — excluded from barrel detection) |
+| **Z** | Toggle detection overlays on/off — lets you see the raw game frame without any markings |
+| **P** | Print the current zone coordinates to the terminal — copy these into `donkey_kong_env.py` |
+| **F** | Advance 60 game frames forward — use to navigate to different game situations |
+| **R** | Reset back to the start of the level |
+
+### How to tune a detection range
+
+1. Run the tool and navigate to a frame where the problem occurs (use **F** to advance frames)
+2. Click on a pixel that should be detected but isn't (or one that's being falsely detected)
+3. Note the HSV values printed in the terminal
+4. Compare with the ranges in `environment/donkey_kong_env.py`:
+   - Ladder (teal): H 83–95, S 220–255, V 190–255
+   - Barrel (orange): H 10–25, S 160–215, V 220–255
+   - Fire: H 12–25, S 50–130, V 220–255
+   - Mario skin: H 0–12, S 45–110, V 215–255
+5. Adjust the range to include the sampled pixel, then restart the tool to verify
+
+### Common issues
+
+| Problem | Likely cause | Fix |
+|---|---|---|
+| Mario not detected | Skin/hat/overalls HSV range too narrow | Click Mario pixels, widen the range |
+| Barrel detected in wrong place | DK zone not covering stacked barrels at top-left | Press D and redraw the DK zone |
+| Fire and barrels confused | Fire S value overlapping barrel S range | Fire has low saturation (S 50–130); barrels have high saturation (S 160+) — check your sampled values |
+| Mario detected as barrel | HUD area not excluded | Press H and redraw the HUD zone |
 
 ---
 
@@ -204,12 +258,12 @@ python tools/debug_detection.py
 The agent watches the screen and decides what button to press every 8 game frames.
 
 **What it sees:** 7 channels total (84×84 pixels each):
-- 4 stacked greyscale frames — motion and layout context
+- 4 stacked greyscale frames — motion and layout context over the last 4 decisions
 - 1 teal/ladder channel — exact positions of all climbable ladders
 - 1 barrel channel — exact positions of rolling barrels
 - 1 fire channel — exact positions of fireballs
 
-This gives the CNN explicit spatial awareness of every danger and every ladder on screen, not just greyscale blobs.
+This gives the CNN explicit spatial awareness of every danger and every ladder on screen. The 4 stacked frames also let it infer movement — a barrel appearing in different positions across the 4 frames tells the CNN it is rolling and which direction it is heading.
 
 **What it can do:** 8 actions — do nothing, left, right, up (climb ladder), down, jump, jump+left, jump+right.
 
@@ -220,16 +274,16 @@ This gives the CNN explicit spatial awareness of every danger and every ladder o
 | Climbing upward | +3 to +10 per NES pixel (scales higher near the top) |
 | Actively climbing a ladder (Up + moving up + near teal) | +3.0 |
 | Near a ladder | +0.3 |
-| Jumping over a barrel or fire | normal height reward |
-| Jumping with no danger nearby | 0 height reward, −0.5 penalty |
+| Jumping when a barrel or fire is nearby | normal height reward |
+| Jumping with no danger nearby | 0 height reward, −0.15 penalty |
 | Barrel within 15 pixels | up to −0.2 |
 | Fire within 20 pixels | up to −0.2 |
-| Each step taken | −0.05 (discourages idling) |
+| Each step taken | −0.1 (discourages idling and hesitation) |
 | Death | −3.0 |
 | Game over | −5.0 |
-| Winning (reaching Pauline) | +500 |
+| Winning (reaching Pauline) | +500 + remaining steps × 0.5 (bonus for finishing fast) |
 
-**Frontier checkpoints:** When Mario reaches a new height record and no danger is nearby, the emulator state is saved. 30% of future episodes start from that saved position, giving the agent concentrated practice at the highest point it has reached rather than always climbing from scratch.
+**Platform checkpoints:** The first time Mario safely reaches each platform, the emulator state is saved. Future episodes are distributed across all saved platforms — weighted toward higher ones — so the agent gets concentrated practice at every transition rather than always climbing from scratch. This also means it drills barrel patterns at each height repeatedly until they become reliable.
 
 **Reward hacking prevention:** The ladder climbing bonus only fires when Mario is actually moving upward — pressing UP while standing still at the base of a ladder gives no bonus.
 
@@ -268,9 +322,10 @@ saved_models/          # Where checkpoints are saved during training
 
 ## Notes
 
-- The ROM is not in this repo — you must provide your own copy
+- The ROM is not in this repo — you must provide your own copy named `Donkey Kong.nes`
 - Saved models are not committed to git — share `.zip` files manually
 - At least 10 million timesteps recommended before the agent starts climbing consistently
 - GPU training (NVIDIA only) is 10–20× faster than CPU — change `device='cpu'` to `device='cuda'` in `training/train_ppo.py`
-- Old saved models (trained before 7-channel observations were added) are incompatible — delete them before retraining
-- If `height/mean` in TensorBoard is flat after 300k steps, the reward signal may need tuning — check `environment/donkey_kong_env.py`
+- Old saved models (trained before 7-channel observations were added) are incompatible — delete them and retrain from scratch
+- Each time you continue training from a checkpoint, TensorBoard creates a new run line — the previous run's graph is preserved separately
+- If `height/mean` in TensorBoard is flat after 300k steps, check `environment/donkey_kong_env.py` — the reward signal may need tuning
