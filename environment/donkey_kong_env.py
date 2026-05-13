@@ -90,6 +90,7 @@ class DonkeyKongEnv:
         self._last_barrel   = np.zeros((FRAME_H, FRAME_W), dtype=np.float32)
         self._last_fire     = np.zeros((FRAME_H, FRAME_W), dtype=np.float32)
         self._max_steps     = MAX_STEPS
+        self._stuck_steps   = 0
         self._reset_mario_y    = MARIO_Y_START
         self._best_y           = MARIO_Y_START   # best height reached (lower Y = higher up)
         self._platform_states  = [None] * len(PLATFORM_THRESHOLDS)   # checkpoint per platform
@@ -120,6 +121,7 @@ class DonkeyKongEnv:
         self._prev_lives   = 3
         self._prev_mario_y = MARIO_Y_START
         self._step_count   = 0
+        self._stuck_steps  = 0
         self._max_steps    = MAX_STEPS + random.randint(-200, 200)
 
         h, w      = obs.shape[:2]

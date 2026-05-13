@@ -161,6 +161,7 @@ def train_ppo(
     if load_model and os.path.exists(load_model + '.zip'):
         print(f'Loading PPO checkpoint: {load_model}')
         model = PPO.load(load_model, env=vec_env)
+        model.tensorboard_log = os.path.join(save_dir, 'tb_logs')
     else:
         model = PPO(
             policy='CnnPolicy',
