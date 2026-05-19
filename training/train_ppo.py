@@ -78,7 +78,7 @@ class HeightCallback(BaseCallback):
                     self._ep_best_y[i] = mario_y
 
             if done and self._ep_start_y[i] is not None:
-                height_px = max(0, MARIO_Y_START - self._ep_best_y[i])
+                height_px = max(0, self._ep_start_y[i] - self._ep_best_y[i])
                 self.logger.record_mean(f'height/env_{i:02d}', height_px)
                 self.logger.record_mean('height/mean', height_px)
                 self._ep_best_y[i]  = 999
@@ -241,7 +241,7 @@ def train_ppo(
             action, _ = model.predict(obs, deterministic=False)
             obs, rewards, dones, infos = vec_env.step(action)
             ep_reward += float(rewards[0])
-            mario_y = infos[0].get('_mario_y', 999)
+            mario_y = infos[0].get('mario_y', 999)
             lives   = infos[0].get('lives')
             if mario_y < ep_best_y:
                 ep_best_y = mario_y

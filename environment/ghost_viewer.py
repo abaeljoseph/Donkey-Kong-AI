@@ -260,9 +260,10 @@ class GhostViewerCallback(BaseCallback):
                 if abs(sr) > self._reward_scale:
                     self._reward_scale = abs(sr)
             if info.get('episode'):
-                best = self._ep_cur_best[i]
-                if best is not None:
-                    self._ep_heights.append(max(0, _MARIO_Y_START - best))
+                best  = self._ep_cur_best[i]
+                start = self._ep_start_y[i]
+                if best is not None and start is not None:
+                    self._ep_heights.append(max(0, start - best))
                 self._ep_start_y[i]    = None
                 self._ep_cur_best[i]   = None
                 self._cur_height_px[i] = 0
@@ -368,6 +369,17 @@ class GhostViewerCallback(BaseCallback):
         for i in range(min(self._num_envs, len(infos))):
             info_i = infos[i]
 
+            # Height tracking — use _mario_y from colour detection
+            mario_y_nes = info_i.get('_mario_y')
+            if mario_y_nes is not None:
+                if self._ep_start_y[i] is None:
+                    self._ep_start_y[i]  = mario_y_nes
+                    self._ep_cur_best[i] = mario_y_nes
+                else:
+                    self._ep_cur_best[i] = min(self._ep_cur_best[i], mario_y_nes)
+                self._cur_height_px[i] = max(0, self._ep_start_y[i] - mario_y_nes)
+
+            # Dot position — color detection for visual overlay only
             if i == 0 and raw_frame is not None:
                 det = raw_frame
                 fw, fh = frame_w, frame_h
@@ -383,14 +395,6 @@ class GhostViewerCallback(BaseCallback):
                 if pos is not None:
                     self._pos[i] = (int(pos[0] * _WIN_W / fw),
                                     int(pos[1] * _WIN_H / fh))
-                    mario_nes_y = int(pos[1] * _NES_H / fh)
-                    # Calibrate start of episode on first successful detection
-                    if self._ep_start_y[i] is None:
-                        self._ep_start_y[i]  = mario_nes_y
-                        self._ep_cur_best[i] = mario_nes_y
-                    else:
-                        self._ep_cur_best[i] = min(self._ep_cur_best[i], mario_nes_y)
-                    self._cur_height_px[i] = max(0, self._ep_start_y[i] - mario_nes_y)
 
         # ── Win line ─────────────────────────────────────────────────────
         win_y_px = int(_MARIO_Y_WIN * _WIN_H / _NES_H)
