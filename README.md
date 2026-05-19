@@ -136,6 +136,11 @@ python main.py --algo ppo --timesteps 10000000 --no-ghost --num-envs 8
 python main.py --algo ppo --timesteps 10000000 --num-envs 8
 ```
 
+**With platform checkpoints enabled (curriculum learning — Mario drills each platform):**
+```bash
+python main.py --algo ppo --timesteps 10000000 --no-ghost --num-envs 8 --checkpoints
+```
+
 **Continue training from a saved checkpoint:**
 ```bash
 python main.py --algo ppo --timesteps 10000000 --no-ghost --load-model saved_models/ppo_XXXXXX_steps
@@ -184,25 +189,87 @@ python main.py --algo ppo --eval-only --load-model saved_models/ppo_final --rend
 
 This opens the game window and shows the AI playing. Each episode prints the reward and highest platform Mario reached.
 
+Mario always starts from the ground by default. Add `--force-highest` to spawn at the highest platform the model has seen, which is useful for testing upper-level behaviour quickly.
+
+---
+
+## Command Reference
+
+All flags can be combined freely. Flags marked **training only** have no effect during `--eval-only`.
+
+### Spawn / checkpoint flags
+
+| Flag | What it does |
+|---|---|
+| *(nothing)* | Mario always spawns at the ground floor |
+| `--checkpoints` | Enable platform checkpoints — Mario spawns randomly across all saved platforms, weighted toward higher ones |
+| `--force-highest` | Always spawn at the highest saved platform — use this alone, it enables checkpoints automatically |
+
+### Common training flags
+
+| Flag | What it does |
+|---|---|
+| `--algo ppo` | Use the PPO algorithm (recommended) |
+| `--timesteps N` | Total number of game steps to train for (e.g. `10000000`) |
+| `--num-envs N` | Number of parallel games running at once — set to your CPU core count |
+| `--no-ghost` | Disable the ghost viewer window — faster training |
+| `--load-model PATH` | Continue training from a saved model (omit `.zip` extension) |
+| `--ppo-save-freq N` | Save a checkpoint every N training steps (default: 50000) |
+
+### Eval flags
+
+| Flag | What it does |
+|---|---|
+| `--eval-only` | Run the model without training — just watch it play |
+| `--render` | Open the game window so you can see Mario playing |
+| `--num-envs 1` | Use a single environment (required for eval with `--render`) |
+
+### Example commands
+
+| Goal | Command |
+|---|---|
+| Train from scratch (fast, no window) | `python main.py --algo ppo --timesteps 10000000 --no-ghost --num-envs 8` |
+| Train with curriculum checkpoints | `python main.py --algo ppo --timesteps 10000000 --no-ghost --num-envs 8 --checkpoints` |
+| Continue training a saved model | `python main.py --algo ppo --timesteps 10000000 --no-ghost --load-model saved_models/ppo_XXXXXX_steps` |
+| Watch the final model play | `python main.py --algo ppo --eval-only --load-model saved_models/ppo_final --render --num-envs 1` |
+| Watch from the highest checkpoint | `python main.py --algo ppo --eval-only --load-model saved_models/ppo_final --render --num-envs 1 --force-highest` |
+| Train with the ghost viewer open | `python main.py --algo ppo --timesteps 10000000 --num-envs 8` |
+
 ---
 
 ## Ghost Viewer — what you're looking at
 
-The ghost viewer window opens automatically during training (omit `--no-ghost` to enable it).
+The ghost viewer window opens automatically during training. Add `--no-ghost` to disable it for faster training.
 
 | What you see | What it means |
 |---|---|
 | Coloured dots (E0–E7) | Each of the 8 agents and where they are on screen |
 | Star ring around a dot | The agent with the highest reward this episode |
 | Orange dot labelled B | A barrel detected rolling toward Mario |
+| Fire dot labelled F | A fireball detected near Mario |
 | Green horizontal line | The win line — Mario needs to reach above this |
-| Red overlay top strip | HUD zone — score display, ignored by the AI |
-| Red box top-left | DK zone — Donkey Kong is excluded so he's not confused with Mario |
+| Cyan box (L0, L1…) | Intact ladder segment — label shows NES coordinates |
+| Red box (BROKEN) | Broken ladder segment — AI is penalised for climbing these |
+| Orange shaded rectangle | Broken ladder penalty zone — pressing UP here costs −50 reward |
+| Red overlay top strip | HUD zone (score display) — hidden when [Z] overlays are off |
+| Red box top-left | DK zone — Donkey Kong excluded from detection — hidden when [Z] overlays are off |
+| `Lv1 Barrels` in the HUD | Current level and stage read from NES RAM — confirms the environment is reading stage/level correctly during training |
 | Chart (bottom-right) | Height chart — shows how high each agent is climbing |
+| Chart (bottom-left) | Reward history — step reward over time as a line per agent |
 
-**Press C** during training to toggle the height chart on and off.
+### Ghost Viewer key controls
 
-The height chart has two panels:
+| Key | What it does |
+|---|---|
+| **C** | Toggle height chart on/off |
+| **R** | Toggle reward history chart on/off |
+| **L** | Toggle ladder labels and broken zone rectangles on/off |
+| **Z** | Toggle HUD and DK exclusion zone overlays on/off |
+| **D** | Toggle barrel and fire danger markers on/off |
+
+The reward history chart (bottom-left) shows the last 300 step rewards for each agent as separate coloured lines. A sharp downward spike means an agent just tried to climb a broken ladder and received the −50 penalty — useful for verifying that broken ladder detection is working.
+
+The height chart (bottom-right) has two panels:
 - **Left** — history graph showing the best height reached per episode over time (you want this trending upward)
 - **Right** — live coloured bars showing each agent's current height in the current episode in NES pixels
 
@@ -227,8 +294,23 @@ The tool opens a window showing the game frame with all detections overlaid. Use
 | **D** then drag | Draw the DK zone (top-left area where Donkey Kong stands — excluded from barrel detection) |
 | **Z** | Toggle detection overlays on/off — lets you see the raw game frame without any markings |
 | **P** | Print the current zone coordinates to the terminal — copy these into `donkey_kong_env.py` |
-| **F** | Advance 60 game frames forward — use to navigate to different game situations |
+| **F** | Advance 20 game frames forward — use to navigate to different game situations |
 | **R** | Reset back to the start of the level |
+| **V** | Enter live mode — play the game yourself with keyboard controls (see below) |
+
+### Live mode (press V)
+
+Lets you play the game interactively from the debug tool. Mario always spawns from the beginning of the Barrels stage.
+
+| Key | What it does |
+|---|---|
+| **Arrow keys** | Move left/right, climb up/down ladders |
+| **Space / Z** | Jump |
+| **Q / Escape** | Exit live mode and return to the debug tool |
+
+The status bar shows the current level and stage (e.g. `Lv1 Barrels`) read directly from NES RAM, so you can verify the stage detection is working correctly.
+
+The terminal also runs an always-on RAM change detector: any address that held a stable value for at least 3 seconds and then changed will be printed automatically. This was used to identify the stage register (address 83) and level counter (address 84).
 
 ### How to tune a detection range
 
@@ -236,10 +318,11 @@ The tool opens a window showing the game frame with all detections overlaid. Use
 2. Click on a pixel that should be detected but isn't (or one that's being falsely detected)
 3. Note the HSV values printed in the terminal
 4. Compare with the ranges in `environment/donkey_kong_env.py`:
-   - Ladder (teal): H 83–95, S 220–255, V 190–255
+   - Ladder (teal): H 75–110, S 60–255, V 80–255
    - Barrel (orange): H 10–25, S 160–215, V 220–255
    - Fire: H 12–25, S 50–130, V 220–255
    - Mario skin: H 0–12, S 45–110, V 215–255
+   - Oil can (enemy, blue): H 110–125, S 190–255, V 200–255
 5. Adjust the range to include the sampled pixel, then restart the tool to verify
 
 ### Common issues
@@ -273,18 +356,24 @@ This gives the CNN explicit spatial awareness of every danger and every ladder o
 |---|---|
 | Climbing upward | +3 to +10 per NES pixel (scales higher near the top) |
 | Actively climbing an intact ladder (Up + moving up + teal immediately above) | +3.0 |
+| Within 20 NES pixels of an intact ladder | up to +0.3 (encourages approaching working ladders) |
 | Jumping when a barrel or fire is nearby | normal height reward |
 | Jumping with no danger nearby | 0 height reward, −0.15 penalty |
 | Barrel within 15 pixels | up to −0.2 |
 | Fire within 20 pixels | up to −0.2 |
+| Pressing UP inside a broken ladder zone | −50.0 |
 | Each step taken | −0.1 (discourages idling and hesitation) |
 | Death | −3.0 |
 | Game over | −5.0 |
-| Winning (reaching Pauline) | +500 + remaining steps × 0.5 (bonus for finishing fast) |
+| Winning (reaching Pauline or stage register changing) | +500 + remaining steps × 0.5 (bonus for finishing fast) |
 
-**Platform checkpoints:** The first time Mario safely reaches each platform, the emulator state is saved. Future episodes are distributed across all saved platforms — weighted toward higher ones — so the agent gets concentrated practice at every transition rather than always climbing from scratch. This also means it drills barrel patterns at each height repeatedly until they become reliable.
+**Platform checkpoints (opt-in with `--checkpoints` or `--force-highest`):** The first time Mario safely reaches each platform, the emulator state is saved. Future episodes are distributed across all saved platforms — weighted toward higher ones — so the agent gets concentrated practice at every transition rather than always climbing from scratch. Disabled by default. Use `--force-highest` alone (no need to also add `--checkpoints`) to always spawn at the highest known platform.
 
-**Broken ladder detection:** The ladder climbing bonus checks for teal pixels within 20px immediately above Mario before firing. Broken ladders have a gap at entry level so no teal is detected there — the bonus is suppressed and Mario has no incentive to stay. Mario can still physically use broken ladder sections to dodge obstacles, he just gets no climbing reward from them. The near-ladder proximity bonus was removed entirely as it caused repeated reward hacking regardless of whether the ladder was intact.
+**Stage and level detection:** The NES RAM is read every step. Address 83 holds the current stage (1 = Barrels, 3 = Elevator, 4 = Rivets) and address 84 holds the level counter (0-indexed, so level 1 = 0). When the stage register changes from its starting value, the episode ends as a win — this catches Mario completing the stage even if the Y-coordinate win check misses it. The ghost viewer HUD shows the current level and stage during training so you can verify it is being read correctly.
+
+**Training strategy — curriculum learning:** The model is trained one stage at a time. The current training run covers the Barrels stage only — when Mario completes it the episode resets to the bottom of Barrels rather than continuing to the Elevator stage. Once the model performs well on Barrels, training continues from the same model file on the Elevator stage (using an Elevator save state), and then Rivets. This keeps a single universal model that is fine-tuned stage by stage, rather than switching between separate models.
+
+**Broken ladder detection:** At startup, the training script automatically captures one clean frame, detects all broken ladder pairs (two small teal stubs with the same X range separated by a small gap), and converts them to NES coordinates. These are passed to every environment so no detection happens during training itself. Pressing UP inside a broken zone costs −50 reward, making broken ladders strongly unattractive. The intact ladder proximity bonus is also withheld for broken sections — only working ladders generate approach rewards. The active climbing bonus additionally checks for teal immediately above Mario, so broken ladder sections (which have a gap at entry) never trigger it either.
 
 ---
 
@@ -326,5 +415,6 @@ saved_models/          # Where checkpoints are saved during training
 - At least 10 million timesteps recommended before the agent starts climbing consistently
 - GPU training (NVIDIA only) is 10–20× faster than CPU — change `device='cpu'` to `device='cuda'` in `training/train_ppo.py`
 - Old saved models (trained before 7-channel observations were added) are incompatible — delete them and retrain from scratch
+- The stage register (NES RAM address 83) cycles through values 1 → 3 → 4 → 1, not 1 → 2 → 3 — this is how the ROM works internally. Slot 2 is reserved and skipped.
 - Each time you continue training from a checkpoint, TensorBoard creates a new run line — the previous run's graph is preserved separately
 - If `height/mean` in TensorBoard is flat after 300k steps, check `environment/donkey_kong_env.py` — the reward signal may need tuning

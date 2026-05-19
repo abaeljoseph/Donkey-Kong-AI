@@ -6,16 +6,25 @@ Controls:
   D          : next drag sets the DK exclusion zone
   Click-drag : draw the selected zone rectangle
   P          : print current zone fractions to console (paste into ghost_viewer.py)
+  L          : print all detected ladder NES coords (paste into BROKEN_LADDER_ZONES)
   F          : advance 60 more emulator frames and recapture
   R          : recapture from the start state
   Z          : toggle overlays on/off (turn off to click true game colors)
+  V          : enter live mode (interactive play)
   Q          : quit
   Click      : print RGB + HSV of that pixel (status bar shows live value under cursor)
 
+Live mode controls (press V):
+  Arrow keys : move / climb
+  Space / Z  : jump
+  S          : take RAM snapshot (press again after level transition to see diff — finds stage register)
+  Q / Esc    : exit live mode
+
 Detections shown:
-  Red overlay  = excluded zones (HUD strip + DK zone)
-  Orange dot B = barrel
-  Green dot  M = Mario
+  Red overlay   = excluded zones (HUD strip + DK zone)
+  Orange dot B  = barrel
+  Green dot  M  = Mario
+  Cyan box   L# = ladder segment (NES coords shown above each box)
 
 Run:  python tools/debug_detection.py
 """
@@ -27,8 +36,10 @@ import cv2
 import numpy as np
 import retro
 import pygame
+from environment.donkey_kong_env import detect_broken_ladder_zones
 
 INTEGRATION_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'retro_data'))
+GAMESTATE_DIR    = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'saved_models', 'gamestates'))
 retro.data.Integrations.add_custom_path(INTEGRATION_PATH)
 
 SCALE    = 3
@@ -115,6 +126,42 @@ def find_barrels(frame_rgb):
     return barrels
 
 
+def find_oil_can(frame_rgb):
+    """Detect oil can in bottom-left by blue colour (sampled HSV=(116,220,232)). Returns (x,y,w,h) or None."""
+    h, w = frame_rgb.shape[:2]
+    hsv  = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2HSV)
+    blue = cv2.inRange(hsv, np.array([110, 190, 200]), np.array([125, 255, 255]))
+    mask = np.zeros_like(blue)
+    mask[int(h * 0.75):, :int(w * 0.25)] = 255
+    blue = cv2.bitwise_and(blue, mask)
+    ys, xs = np.where(blue > 0)
+    if len(xs) < 10:
+        return None
+    x0, y0 = int(xs.min()), int(ys.min())
+    x1, y1 = int(xs.max()), int(ys.max())
+    return (x0, y0, x1 - x0, y1 - y0)
+
+
+def find_ladders(frame_rgb):
+    """Detect ladder segments by teal colour. Returns list of (x, y, w, h) in frame pixels."""
+    h, w = frame_rgb.shape[:2]
+    hsv  = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2HSV)
+    teal = cv2.inRange(hsv, np.array([75, 60, 80]), np.array([110, 255, 255]))
+    teal[:int(hud_zone[3] * h), :] = 0          # exclude HUD
+    teal[int(h * 0.85):, :int(w * 0.20)] = 0    # exclude oil-can corner (bottom-left)
+    n, _, stats, _ = cv2.connectedComponentsWithStats(teal, connectivity=8)
+    ladders = []
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] > 10:
+            ladders.append((
+                stats[i, cv2.CC_STAT_LEFT],
+                stats[i, cv2.CC_STAT_TOP],
+                stats[i, cv2.CC_STAT_WIDTH],
+                stats[i, cv2.CC_STAT_HEIGHT],
+            ))
+    return ladders
+
+
 def find_fires(frame_rgb):
     h, w = frame_rgb.shape[:2]
     hsv = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2HSV)
@@ -179,6 +226,41 @@ def draw_scene(screen, frame_rgb, font, drag_mode, drag_rect, show_overlays, mou
             pygame.draw.circle(screen, (255, 255, 0), (fx_w, fy_w), 10, 2)
             screen.blit(font.render('F', True, (255, 255, 0)), (fx_w - 5, fy_w - 7))
 
+        # Oil can
+        oil = find_oil_can(frame_rgb)
+        if oil:
+            ox, oy, ow, oh = oil
+            ox_w = int(ox * WIN_W / w);  oy_w = int(oy * WIN_H / h)
+            ow_w = max(int(ow * WIN_W / w), 6);  oh_w = max(int(oh * WIN_H / h), 6)
+            s = pygame.Surface((ow_w + 10, oh_w + 10), pygame.SRCALPHA)
+            s.fill((255, 30, 30, 100))
+            screen.blit(s, (ox_w - 5, oy_w - 5))
+            pygame.draw.rect(screen, (255, 30, 30), (ox_w - 5, oy_w - 5, ow_w + 10, oh_w + 10), 2)
+            screen.blit(font.render('OIL CAN (enemy)', True, (255, 80, 80)), (ox_w, max(oy_w - 14, 0)))
+
+        # Ladder boxes — cyan=intact, red=broken, coords always shown
+        ladders    = find_ladders(frame_rgb)
+        frame_hsv2 = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2HSV)
+        broken_nes = detect_broken_ladder_zones(frame_hsv2, h, w)
+        broken_px_regions = broken_nes   # already in frame pixel coords
+        for idx, (lx, ly, lw, lh) in enumerate(ladders):
+            # A ladder is broken if its centre overlaps any broken zone
+            cx, cy = lx + lw // 2, ly + lh // 2
+            is_broken = any(
+                bx0 <= cx <= bx1 and by0 <= cy <= by1
+                for bx0, by0, bx1, by1 in broken_px_regions
+            )
+            color = (255, 60, 60) if is_broken else (0, 220, 220)
+            wx0 = int(lx * WIN_W / w);  wy0 = int(ly * WIN_H / h)
+            wwx = max(int(lw * WIN_W / w), 4)
+            wwh = max(int(lh * WIN_H / h), 4)
+            pygame.draw.rect(screen, color, (wx0, wy0, wwx, wwh), 2)
+            nes_x0 = int(lx * NES_W / w);        nes_y0 = int(ly * NES_H / h)
+            nes_x1 = int((lx + lw) * NES_W / w); nes_y1 = int((ly + lh) * NES_H / h)
+            prefix = 'BROKEN' if is_broken else f'L{idx}'
+            label  = f'{prefix} ({nes_x0},{nes_y0})-({nes_x1},{nes_y1})'
+            screen.blit(font.render(label, True, color), (wx0, max(wy0 - 14, 0)))
+
         # Mario dot
         mario = find_mario(frame_rgb)
         if mario:
@@ -190,6 +272,7 @@ def draw_scene(screen, frame_rgb, font, drag_mode, drag_rect, show_overlays, mou
     else:
         barrels = find_barrels(frame_rgb)
         fires   = find_fires(frame_rgb)
+        ladders = find_ladders(frame_rgb)
         mario   = find_mario(frame_rgb)
 
     # Crosshair on cursor pixel (snapped to NES grid)
@@ -212,11 +295,11 @@ def draw_scene(screen, frame_rgb, font, drag_mode, drag_rect, show_overlays, mou
 
     color_y   = mario[1] if mario else '?'
     color_x   = mario[0] if mario else '?'
-    mario_str = f'Mario: ({color_x},{color_y})  lives={ram_info.get("lives","?") if ram_info else "?"}'
+    mario_str = f'Mario: ({color_x},{color_y})  lives={ram_info.get("lives","?") if ram_info else "?"}  stage={ram_info.get("stage","?") if ram_info else "?"}'
 
     overlay_str = '[Z] overlays ON' if show_overlays else '[Z] overlays OFF — click raw pixels'
-    mode_str    = f'[{drag_mode}] drag to draw' if drag_mode else 'H=HUD  D=DK  P=print  F=+60fr  R=restart  Q=quit'
-    status      = f'Barrels:{len(barrels)}  Fires:{len(fires)}  {mario_str}  {overlay_str}  {mode_str}{cursor_str}'
+    mode_str    = f'[{drag_mode}] drag to draw' if drag_mode else 'H=HUD  D=DK  P=print  F=+20fr  R=restart  V=live(S=RAM scan)  Q=quit'
+    status      = f'Barrels:{len(barrels)}  Fires:{len(fires)}  Ladders:{len(ladders)}  {mario_str}  {overlay_str}  {mode_str}{cursor_str}'
     screen.blit(font.render(status, True, (0,0,0)),       (7, WIN_H - 19))
     screen.blit(font.render(status, True, (220,220,220)), (6, WIN_H - 20))
 
@@ -232,12 +315,124 @@ def print_zones():
     print(f'_DK_Y1  = {dk_zone[3]:.3f}\n')
 
 
+def run_live_mode(screen, font, clock):
+    """
+    Live interactive mode — persistent env, keyboard control, real-time RAM readout.
+    Loads from the highest saved platform checkpoint automatically.
+    Press Q to exit back to the debug tool.
+
+    Controls:
+      Arrow keys   : move / climb
+      Space / Z    : jump
+      S            : snapshot RAM (press again after level transition to diff)
+      Q / Escape   : quit live mode
+    """
+    env = retro.make(
+        game='DonkeyKong-Nes',
+        state='1Player.GameA',
+        inttype=retro.data.Integrations.CUSTOM_ONLY,
+    )
+    obs, info = env.reset()
+
+    print(f'\n[Live] Started from beginning')
+    print(f'[Live] Controls: arrow keys=move  Space=jump  S=RAM stability watch  Q=quit')
+    print(f'[Live] Press S at the start, play to level 2, press S again — finds addresses stable during level 1 that changed at the transition\n')
+
+    mario_y = info.get('mario_y', '?')
+    lives   = info.get('lives', '?')
+    print(f'[Live] Initial mario_y={mario_y}  lives={lives}')
+
+    WORK_RAM      = 2048          # NES internal RAM is the first 2048 bytes
+    STABLE_FRAMES = 180           # must be stable ≥ 3 s at 60 fps to print
+    frame_count   = 0
+    prev_ram      = None          # RAM from the last step
+    last_changed  = np.zeros(WORK_RAM, dtype=np.int32)  # frame# of last change per addr
+
+    def get_ram():
+        try:
+            raw = env.get_ram()
+            return np.array(raw, dtype=np.uint8)[:WORK_RAM]
+        except AttributeError:
+            return None
+
+    running = True
+    while running:
+        # Build action from held keys
+        keys   = pygame.key.get_pressed()
+        action = [0] * 9
+        if keys[pygame.K_RIGHT]:   action[7] = 1
+        if keys[pygame.K_LEFT]:    action[6] = 1
+        if keys[pygame.K_UP]:      action[4] = 1
+        if keys[pygame.K_DOWN]:    action[5] = 1
+        if keys[pygame.K_SPACE]:   action[8] = 1
+        if keys[pygame.K_z]:       action[8] = 1
+
+        obs, _, done, _, info = env.step(action)
+        current_ram = get_ram()
+        frame_count += 1
+
+        mario_y = info.get('mario_y', '?')
+        mario_x = info.get('mario_x', '?')
+        lives   = info.get('lives',   '?')
+        stage   = info.get('stage',   '?')
+        level   = info.get('level',   '?')
+
+        # Auto rare-change detector: print any work-RAM address that held
+        # steady for ≥ STABLE_FRAMES but just flipped this frame.
+        if prev_ram is not None and current_ram is not None:
+            changed = np.where(current_ram != prev_ram)[0]
+            for addr in changed:
+                stable_for = frame_count - last_changed[addr]
+                if stable_for >= STABLE_FRAMES:
+                    print(f'[RAM] addr {addr:4d} (0x{addr:03X}):  '
+                          f'{prev_ram[addr]:3d} -> {current_ram[addr]:3d}'
+                          f'  (stable {stable_for} frames = {stable_for/60:.1f}s)')
+                last_changed[addr] = frame_count
+
+        prev_ram = current_ram
+
+        if done:
+            obs, info = env.reset()
+            current_ram = get_ram()
+            prev_ram = current_ram
+            last_changed[:] = frame_count
+            print(f'[Live] Episode ended — reset  mario_y={info.get("mario_y","?")}  lives={info.get("lives","?")}')
+
+        # Draw frame
+        frame_rgb = obs
+        h, w      = frame_rgb.shape[:2]
+        surf      = pygame.surfarray.make_surface(frame_rgb.transpose(1, 0, 2))
+        scaled    = pygame.transform.scale(surf, (WIN_W, WIN_H))
+        screen.blit(scaled, (0, 0))
+
+        STAGE_DISPLAY = {1: 'Barrels', 3: 'Elevator', 4: 'Rivets'}
+        stage_str = STAGE_DISPLAY.get(stage, f'stage={stage}')
+        lv_str = level + 1 if isinstance(level, int) else level
+        status = (f'LIVE  Lv{lv_str}  {stage_str}  mario=({mario_x},{mario_y})  lives={lives}'
+                  f'   Arrow=move  Space=jump  Q=quit')
+        screen.blit(font.render(status, True, (0,   0,   0)),   (7, WIN_H - 19))
+        screen.blit(font.render(status, True, (255, 255, 50)),   (6, WIN_H - 20))
+
+        pygame.display.flip()
+        clock.tick(60)
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key in (pygame.K_q, pygame.K_ESCAPE):
+                    running = False
+
+    env.close()
+    print('[Live] Exited live mode')
+
+
 def main():
     global hud_zone, dk_zone
 
     pygame.init()
     screen = pygame.display.set_mode((WIN_W, WIN_H))
-    pygame.display.set_caption('Detection Debug — H/D=zone  drag=draw  P=print  F=+60fr  R=restart  Q=quit')
+    pygame.display.set_caption('Detection Debug — H/D=zone  F=+20fr  R=restart  V=live mode  Q=quit')
     font  = pygame.font.SysFont(None, 18)
     clock = pygame.time.Clock()
 
@@ -284,20 +479,33 @@ def main():
                     print('Mode: draw DK zone (drag a box around DK)')
                 elif event.key == pygame.K_p:
                     print_zones()
+                elif event.key == pygame.K_l:
+                    ladders = find_ladders(frame)
+                    fh, fw  = frame.shape[:2]
+                    print('\n── Ladder NES coords (paste into BROKEN_LADDER_ZONES) ──')
+                    print('BROKEN_LADDER_ZONES = [')
+                    for idx, (lx, ly, lw, lh) in enumerate(ladders):
+                        nx0 = int(lx * NES_W / fw);  ny0 = int(ly * NES_H / fh)
+                        nx1 = int((lx + lw) * NES_W / fw)
+                        ny1 = int((ly + lh) * NES_H / fh)
+                        print(f'    ({nx0}, {ny0}, {nx1}, {ny1}),   # L{idx}')
+                    print(']')
                 elif event.key == pygame.K_f:
-                    total_advance += 60
+                    total_advance += 20
                     frame, ram_info = capture_frame(total_advance)
                     frame_hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
                     mario = find_mario(frame)
                     color_y = mario[1] if mario else '?'
                     color_x = mario[0] if mario else '?'
-                    print(f'frame={total_advance:5d}  RAM=({ram_info.get("mario_x","?"):>3},{ram_info.get("mario_y","?"):>3})  COLOR=({color_x},{color_y})  lives={ram_info.get("lives","?")}')
+                    print(f'frame={total_advance:5d}  RAM=({ram_info.get("mario_x","?"):>3},{ram_info.get("mario_y","?"):>3})  COLOR=({color_x},{color_y})  lives={ram_info.get("lives","?")}  stage={ram_info.get("stage","?")}')
                 elif event.key == pygame.K_r:
                     total_advance = 180
                     print('Recapturing from start...')
                     frame, ram_info = capture_frame(total_advance)
                     frame_hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
-                    print(f'RAM values: mario_y={ram_info.get("mario_y","?")}  mario_x={ram_info.get("mario_x","?")}  lives={ram_info.get("lives","?")}')
+                    print(f'RAM values: mario_y={ram_info.get("mario_y","?")}  mario_x={ram_info.get("mario_x","?")}  lives={ram_info.get("lives","?")}  stage={ram_info.get("stage","?")}')
+                elif event.key == pygame.K_v:
+                    run_live_mode(screen, font, clock)
 
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 if drag_mode:

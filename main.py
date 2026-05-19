@@ -33,7 +33,9 @@ def parse_args():
     # PPO args
     p.add_argument('--timesteps',   type=int,   default=1_000_000, help='PPO: total env timesteps')
     p.add_argument('--ppo-save-freq', type=int, default=50_000,    help='PPO: checkpoint every N steps')
-    p.add_argument('--no-ghost',      action='store_true',          help='Disable ghost viewer window')
+    p.add_argument('--no-ghost',       action='store_true', help='Disable ghost viewer window')
+    p.add_argument('--checkpoints',    action='store_true', help='Enable checkpoint spawning during training/eval')
+    p.add_argument('--force-highest',  action='store_true', help='Always spawn at the highest saved checkpoint (implies --checkpoints)')
     # Shared
     p.add_argument('--num-envs',    type=int,   default=24,  help='Parallel environments')
     p.add_argument('--render',      action='store_true', help='Render game window (env 0 only)')
@@ -65,6 +67,8 @@ def main():
             save_dir=args.save_dir,
             save_freq=args.ppo_save_freq,
             ghost_viewer=not args.no_ghost,
+            use_checkpoints=args.checkpoints or args.force_highest,
+            force_highest=args.force_highest,
         )
     else:
         from training.train import train

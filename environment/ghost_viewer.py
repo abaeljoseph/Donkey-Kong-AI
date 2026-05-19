@@ -6,6 +6,7 @@ Ghost viewer:
   DK zone     : fixed exclusion rectangle so DK is never mistaken for Mario
 """
 
+import collections
 import cv2
 import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback
@@ -126,6 +127,31 @@ def _find_barrels_color(frame_rgb):
     return barrels
 
 
+# ── Oil can detection ─────────────────────────────────────────────────────────
+
+def _find_oil_can(frame_rgb):
+    """
+    Detect the oil can in the bottom-left corner by its blue colour.
+    Sampled pixel HSV=(116,220,232). Returns (x, y, w, h) bounding box or None.
+    """
+    if frame_rgb is None:
+        return None
+    h, w = frame_rgb.shape[:2]
+    hsv  = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2HSV)
+    blue = cv2.inRange(hsv, np.array([110, 190, 200]), np.array([125, 255, 255]))
+    # Only look in the bottom-left quarter
+    mask = np.zeros_like(blue)
+    mask[int(h * 0.75):, :int(w * 0.25)] = 255
+    blue = cv2.bitwise_and(blue, mask)
+    ys, xs = np.where(blue > 0)
+    if len(xs) < 10:
+        return None
+    x0, y0 = int(xs.min()), int(ys.min())
+    x1, y1 = int(xs.max()), int(ys.max())
+    return (x0, y0, x1 - x0, y1 - y0)
+
+
+
 # ── Fire detection ─────────────────────────────────────────────────────────────
 
 def _find_fires_color(frame_rgb):
@@ -167,22 +193,37 @@ def _find_fires_color(frame_rgb):
 
 class GhostViewerCallback(BaseCallback):
 
-    def __init__(self, num_envs: int, verbose: int = 0):
+    def __init__(self, num_envs: int, all_ladders=None, broken_zones=None, verbose: int = 0):
         super().__init__(verbose)
         self._num_envs      = num_envs
         default_pos         = (_WIN_W // 2, int(0.73 * _WIN_H))
         self._pos           = [default_pos] * num_envs
         self._ep_rewards    = [0.0] * num_envs
+        self._step_rewards  = [0.0] * num_envs
+        self._reward_scale  = 10.0
         self._best_env      = 0
         self._pygame        = None
-        self._cached_bg     = None    # last received full-color frame from env 0
+        self._cached_bg     = None
 
         # Height chart state
-        self._show_chart    = True    # toggle with C key
-        self._ep_heights    = []      # best height (px climbed from start) per finished episode
-        self._ep_start_y    = [None] * num_envs   # first detected mario_y of each episode
-        self._ep_cur_best   = [None] * num_envs   # lowest mario_y seen this episode (lower=higher)
-        self._cur_height_px = [0]    * num_envs   # live pixels climbed this step
+        self._show_chart    = True
+        self._ep_heights    = []
+        self._ep_start_y    = [None] * num_envs
+        self._ep_cur_best   = [None] * num_envs
+        self._cur_height_px = [0]    * num_envs
+
+        # Reward history chart state — keeps last 300 step rewards per env
+        self._show_reward_chart = True
+        self._reward_history    = [collections.deque(maxlen=300) for _ in range(num_envs)]
+
+        # Static level data from startup detection (NES coords)
+        self._all_ladders  = all_ladders  or []   # (nes_x0, nes_y0, nes_x1, nes_y1)
+        self._broken_zones = broken_zones or []   # broken penalty zones in NES coords
+
+        # Overlay toggles
+        self._show_ladders = True    # ladder labels + broken zone rectangles
+        self._show_zones   = True    # HUD + DK exclusion zone overlays
+        self._show_dangers = True    # barrel + fire dots
 
     def _on_training_start(self) -> None:
         try:
@@ -194,8 +235,9 @@ class GhostViewerCallback(BaseCallback):
             self._font_sm  = pygame.font.SysFont(None, 16)
             self._font_hud = pygame.font.SysFont(None, 24)
             self._clock    = pygame.time.Clock()
+            print(f'[GhostViewer] window open ({_WIN_W}×{_WIN_H}) — check your taskbar if you can\'t see it', flush=True)
         except Exception as e:
-            print(f'[GhostViewer] pygame init failed ({e}), viewer disabled.')
+            print(f'[GhostViewer] FAILED TO OPEN — {type(e).__name__}: {e}', flush=True)
             self._pygame = None
 
     def _on_step(self) -> bool:
@@ -210,16 +252,22 @@ class GhostViewerCallback(BaseCallback):
         for i, info in enumerate(infos):
             if i < len(rewards):
                 self._ep_rewards[i] += float(rewards[i])
+            sr = info.get('_step_reward')
+            if sr is not None and i < self._num_envs:
+                sr = float(sr)
+                self._step_rewards[i] = sr
+                self._reward_history[i].append(sr)
+                if abs(sr) > self._reward_scale:
+                    self._reward_scale = abs(sr)
             if info.get('episode'):
-                # Record best height reached this episode
-                start = self._ep_start_y[i]
-                best  = self._ep_cur_best[i]
-                if start is not None and best is not None:
-                    self._ep_heights.append(max(0, start - best))
-                self._ep_start_y[i]   = None
-                self._ep_cur_best[i]  = None
+                best = self._ep_cur_best[i]
+                if best is not None:
+                    self._ep_heights.append(max(0, _MARIO_Y_START - best))
+                self._ep_start_y[i]    = None
+                self._ep_cur_best[i]   = None
                 self._cur_height_px[i] = 0
-                self._ep_rewards[i]   = 0.0
+                self._ep_rewards[i]    = 0.0
+                self._step_rewards[i]  = 0.0
 
         self._best_env = int(np.argmax(self._ep_rewards))
 
@@ -238,27 +286,69 @@ class GhostViewerCallback(BaseCallback):
             self._screen.fill((15, 15, 30))
             frame_w, frame_h = _NES_W, _NES_H
 
-        # ── Exclusion zone overlays ──────────────────────────────────────
-        hud_h_px = int(_HUD_Y * _WIN_H)
-        hud_surf = pg.Surface((_WIN_W, hud_h_px), pg.SRCALPHA)
-        hud_surf.fill((255, 50, 50, 80))
-        self._screen.blit(hud_surf, (0, 0))
-        pg.draw.line(self._screen, (255, 80, 80), (0, hud_h_px), (_WIN_W, hud_h_px), 1)
-        self._screen.blit(self._font_sm.render('HUD', True, (255, 120, 120)), (4, 2))
+        # ── Exclusion zone overlays (HUD + DK zone) ─────────────────────
+        if self._show_zones:
+            hud_h_px = int(_HUD_Y * _WIN_H)
+            hud_surf = pg.Surface((_WIN_W, hud_h_px), pg.SRCALPHA)
+            hud_surf.fill((255, 50, 50, 80))
+            self._screen.blit(hud_surf, (0, 0))
+            pg.draw.line(self._screen, (255, 80, 80), (0, hud_h_px), (_WIN_W, hud_h_px), 1)
+            self._screen.blit(self._font_sm.render('HUD', True, (255, 120, 120)), (4, 2))
 
-        dk_x0_px = int(_DK_X0 * _WIN_W)
-        dk_y0_px = int(_DK_Y0 * _WIN_H)
-        dk_w_px  = int((_DK_X1 - _DK_X0) * _WIN_W)
-        dk_h_px  = int((_DK_Y1 - _DK_Y0) * _WIN_H)
-        dk_surf  = pg.Surface((dk_w_px, dk_h_px), pg.SRCALPHA)
-        dk_surf.fill((255, 50, 50, 80))
-        self._screen.blit(dk_surf, (dk_x0_px, dk_y0_px))
-        pg.draw.rect(self._screen, (255, 80, 80), (dk_x0_px, dk_y0_px, dk_w_px, dk_h_px), 2)
-        self._screen.blit(self._font_sm.render('DK ZONE', True, (255, 120, 120)),
-                          (dk_x0_px + 4, dk_y0_px + 4))
+            dk_x0_px = int(_DK_X0 * _WIN_W)
+            dk_y0_px = int(_DK_Y0 * _WIN_H)
+            dk_w_px  = int((_DK_X1 - _DK_X0) * _WIN_W)
+            dk_h_px  = int((_DK_Y1 - _DK_Y0) * _WIN_H)
+            dk_surf  = pg.Surface((dk_w_px, dk_h_px), pg.SRCALPHA)
+            dk_surf.fill((255, 50, 50, 80))
+            self._screen.blit(dk_surf, (dk_x0_px, dk_y0_px))
+            pg.draw.rect(self._screen, (255, 80, 80), (dk_x0_px, dk_y0_px, dk_w_px, dk_h_px), 2)
+            self._screen.blit(self._font_sm.render('DK ZONE', True, (255, 120, 120)),
+                              (dk_x0_px + 4, dk_y0_px + 4))
 
-        # ── Barrel dots (from env 0 cached frame) ───────────────────────
-        if self._cached_bg is not None:
+        # ── Oil can ──────────────────────────────────────────────────────
+        oil = _find_oil_can(self._cached_bg) if self._cached_bg is not None else None
+        if oil:
+            ox, oy, ow, oh = oil
+            ox_w = int(ox * _WIN_W / frame_w);  oy_w = int(oy * _WIN_H / frame_h)
+            ow_w = max(int(ow * _WIN_W / frame_w), 6)
+            oh_w = max(int(oh * _WIN_H / frame_h), 6)
+            oil_surf = pg.Surface((ow_w + 10, oh_w + 10), pg.SRCALPHA)
+            oil_surf.fill((255, 30, 30, 100))
+            self._screen.blit(oil_surf, (ox_w - 5, oy_w - 5))
+            pg.draw.rect(self._screen, (255, 30, 30), (ox_w - 5, oy_w - 5, ow_w + 10, oh_w + 10), 2)
+            self._screen.blit(self._font_sm.render('OIL ☠', True, (255, 80, 80)), (ox_w, oy_w - 14))
+
+        # ── Ladders + broken zones (static reference coords from startup) ─
+        if self._show_ladders and self._all_ladders:
+            for idx, (nx0, ny0, nx1, ny1) in enumerate(self._all_ladders):
+                cx_nes = (nx0 + nx1) // 2
+                cy_nes = (ny0 + ny1) // 2
+                is_broken = any(
+                    z[0] <= cx_nes <= z[2] and z[1] <= cy_nes <= z[3]
+                    for z in self._broken_zones
+                )
+                color  = (255, 60, 60) if is_broken else (0, 220, 220)
+                wx0    = int(nx0 * _WIN_W / 256)
+                wy0    = int(ny0 * _WIN_H / 224)
+                ww     = max(int((nx1 - nx0) * _WIN_W / 256), 4)
+                wh     = max(int((ny1 - ny0) * _WIN_H / 224), 4)
+                pg.draw.rect(self._screen, color, (wx0, wy0, ww, wh), 2)
+                prefix = 'BROKEN' if is_broken else f'L{idx}'
+                label  = f'{prefix} ({nx0},{ny0})-({nx1},{ny1})'
+                self._screen.blit(self._font_sm.render(label, True, color),
+                                  (wx0, max(wy0 - 13, 0)))
+            # Broken penalty zone rectangles (orange fill)
+            for z in self._broken_zones:
+                wx0 = int(z[0] * _WIN_W / 256);  wy0 = int(z[1] * _WIN_H / 224)
+                wx1 = int(z[2] * _WIN_W / 256);  wy1 = int(z[3] * _WIN_H / 224)
+                zsurf = pg.Surface((wx1 - wx0, wy1 - wy0), pg.SRCALPHA)
+                zsurf.fill((255, 120, 0, 40))
+                self._screen.blit(zsurf, (wx0, wy0))
+                pg.draw.rect(self._screen, (255, 120, 0), (wx0, wy0, wx1 - wx0, wy1 - wy0), 1)
+
+        # ── Barrel + fire dots ───────────────────────────────────────────
+        if self._show_dangers and self._cached_bg is not None:
             for bx, by in _find_barrels_color(self._cached_bg):
                 bx_win = int(bx * _WIN_W / frame_w)
                 by_win = int(by * _WIN_H / frame_h)
@@ -266,9 +356,6 @@ class GhostViewerCallback(BaseCallback):
                 pg.draw.circle(self._screen, (0, 0, 0), (bx_win, by_win), 7, 2)
                 self._screen.blit(self._font_sm.render('B', True, (0, 0, 0)),
                                   (bx_win - 4, by_win - 6))
-
-        # ── Fire dots (from env 0 cached frame) ─────────────────────────
-        if self._cached_bg is not None:
             for fx, fy in _find_fires_color(self._cached_bg):
                 fx_win = int(fx * _WIN_W / frame_w)
                 fy_win = int(fy * _WIN_H / frame_h)
@@ -320,16 +407,34 @@ class GhostViewerCallback(BaseCallback):
             pg.draw.circle(self._screen, color, (wx, wy), r)
             tag = self._font_sm.render(f'E{i}{"★" if is_best else ""}', True, color)
             self._screen.blit(tag, (wx + r + 2, wy - 7))
+            sr = self._step_rewards[i] if i < len(self._step_rewards) else 0.0
+            sr_col = (80, 255, 80) if sr > 0.1 else (255, 80, 80) if sr < -0.1 else (180, 180, 180)
+            self._screen.blit(self._font_sm.render(f'{sr:+.1f}', True, sr_col), (wx + r + 2, wy + 5))
 
         # ── HUD ──────────────────────────────────────────────────────────
-        txt = f'steps: {self.num_timesteps:,}   best: E{self._best_env}   [C] chart {"ON" if self._show_chart else "OFF"}'
-        self._screen.blit(self._font_hud.render(txt, True, (0, 0, 0)),       (7, 7))
-        self._screen.blit(self._font_hud.render(txt, True, (230, 230, 230)), (6, 6))
+        _STAGE_LABEL = {1: 'Barrels', 3: 'Elevator', 4: 'Rivets'}
+        _stage = infos[0].get('_stage', '?') if infos else '?'
+        _level = infos[0].get('_level', '?') if infos else '?'
+        _stage_str = _STAGE_LABEL.get(_stage, f'stage={_stage}')
+        _lv_str = (_level + 1) if isinstance(_level, int) else _level
+        txt1 = f'steps: {self.num_timesteps:,}   best: E{self._best_env}   Lv{_lv_str} {_stage_str}'
+        txt2 = (f'[C] height {"ON" if self._show_chart else "OFF"}'
+                f'  [R] rewards {"ON" if self._show_reward_chart else "OFF"}'
+                f'  [L] ladders {"ON" if self._show_ladders else "OFF"}'
+                f'  [Z] HUD/DK {"ON" if self._show_zones else "OFF"}'
+                f'  [D] dangers {"ON" if self._show_dangers else "OFF"}')
+        self._screen.blit(self._font_hud.render(txt1, True, (0, 0, 0)),       (7,  7))
+        self._screen.blit(self._font_hud.render(txt1, True, (230, 230, 230)), (6,  6))
+        self._screen.blit(self._font_sm.render(txt2,  True, (0, 0, 0)),       (7, 27))
+        self._screen.blit(self._font_sm.render(txt2,  True, (200, 200, 200)), (6, 26))
 
         # ── Height chart ─────────────────────────────────────────────────
         if self._show_chart and len(self._ep_heights) >= 2:
             self._draw_height_chart(pg)
 
+        # ── Reward history chart ─────────────────────────────────────────
+        if self._show_reward_chart:
+            self._draw_reward_chart(pg)
         pg.display.flip()
         self._clock.tick(0)   # uncapped — run as fast as training allows
 
@@ -339,8 +444,85 @@ class GhostViewerCallback(BaseCallback):
                 pg.quit()
             elif event.type == pg.KEYDOWN and event.key == pg.K_c:
                 self._show_chart = not self._show_chart
+            elif event.type == pg.KEYDOWN and event.key == pg.K_r:
+                self._show_reward_chart = not self._show_reward_chart
+            elif event.type == pg.KEYDOWN and event.key == pg.K_l:
+                self._show_ladders = not self._show_ladders
+            elif event.type == pg.KEYDOWN and event.key == pg.K_z:
+                self._show_zones = not self._show_zones
+            elif event.type == pg.KEYDOWN and event.key == pg.K_d:
+                self._show_dangers = not self._show_dangers
 
         return True
+
+    def _draw_reward_chart(self, pg):
+        """
+        Bottom-left panel: step reward history for each env as separate coloured lines.
+        Useful for spotting negative spikes (e.g. broken-ladder penalty of -50).
+        Toggle with R key.
+        """
+        CHART_W, CHART_H = 278, 150
+        CHART_X          = 4
+        CHART_Y          = _WIN_H - CHART_H - 10
+
+        panel = pg.Surface((CHART_W, CHART_H), pg.SRCALPHA)
+        panel.fill((10, 10, 30, 210))
+        self._screen.blit(panel, (CHART_X, CHART_Y))
+        pg.draw.rect(self._screen, (80, 80, 160), (CHART_X, CHART_Y, CHART_W, CHART_H), 1)
+        self._screen.blit(self._font_sm.render('Step reward history [R]', True, (180, 180, 255)),
+                          (CHART_X + 4, CHART_Y + 3))
+
+        # Plot area
+        plot_x0 = CHART_X + 26
+        plot_y0 = CHART_Y + 16
+        plot_w  = CHART_W - 30
+        plot_h  = CHART_H - 24
+
+        # Dynamic y scale across all histories
+        all_vals = [v for hist in self._reward_history for v in hist]
+        if not all_vals:
+            return
+        y_min = min(all_vals)
+        y_max = max(all_vals)
+        if y_max == y_min:
+            y_min -= 1.0; y_max += 1.0
+
+        def to_screen_y(v):
+            frac = (v - y_min) / (y_max - y_min)
+            return max(plot_y0, min(plot_y0 + plot_h, plot_y0 + plot_h - int(frac * plot_h)))
+
+        # Zero line
+        zero_y = to_screen_y(0.0)
+        pg.draw.line(self._screen, (120, 120, 120),
+                     (plot_x0, zero_y), (plot_x0 + plot_w, zero_y), 1)
+
+        # Y-axis labels
+        self._screen.blit(self._font_sm.render(f'{y_max:+.0f}', True, (100, 255, 100)),
+                          (CHART_X + 1, plot_y0))
+        self._screen.blit(self._font_sm.render('0', True, (160, 160, 160)),
+                          (CHART_X + 1, zero_y - 6))
+        self._screen.blit(self._font_sm.render(f'{y_min:+.0f}', True, (255, 100, 100)),
+                          (CHART_X + 1, plot_y0 + plot_h - 10))
+
+        # One coloured line per env
+        for i in range(self._num_envs):
+            hist = list(self._reward_history[i])
+            if len(hist) < 2:
+                continue
+            color = _COLORS[i % len(_COLORS)]
+            n = len(hist)
+            points = [
+                (plot_x0 + int(idx * plot_w / max(n - 1, 1)), to_screen_y(v))
+                for idx, v in enumerate(hist)
+            ]
+            pg.draw.lines(self._screen, color, False, points, 1)
+            # Current value label at the right edge
+            cur = hist[-1]
+            cur_col = (80, 255, 80) if cur >= 0 else (255, 80, 80)
+            self._screen.blit(
+                self._font_sm.render(f'E{i} {cur:+.1f}', True, cur_col),
+                (plot_x0 + plot_w + 2, to_screen_y(cur) - 5),
+            )
 
     def _draw_height_chart(self, pg):
         """
