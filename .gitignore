@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+venv/
+.env
+
+# Editor
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ML / training artifacts
+*.zip
+checkpoints/
+saved_models/
+results/
+runs/
+wandb/
+
+# Data / media
+*.npz
+*.png
+*.jpg
+*.gif
