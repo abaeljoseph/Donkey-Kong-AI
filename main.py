@@ -13,8 +13,11 @@ Continue training a checkpoint:
 Watch a saved model:
     python main.py --algo ppo --eval-only --load-model saved_models/ppo_final --render --num-envs 1
 
-Robot arm:
+PyBullet simulated arms:
     python main.py --algo ppo --arm-gui
+
+Real UR3 arms (calibrate first with tools/calibrate_arms.py):
+    python main.py --algo ppo --eval-only --load-model <ckpt> --real-arms --num-envs 1
 """
 
 import argparse
@@ -38,8 +41,9 @@ def parse_args():
     # Shared
     p.add_argument('--num-envs',    type=int,   default=24,  help='Parallel environments')
     p.add_argument('--render',      action='store_true', help='Render game window (env 0 only)')
-    p.add_argument('--arm',         action='store_true', help='Enable PyBullet robot arm')
+    p.add_argument('--arm',         action='store_true', help='Enable PyBullet simulated arm')
     p.add_argument('--arm-gui',     action='store_true', help='Show PyBullet arm GUI (implies --arm)')
+    p.add_argument('--real-arms',   action='store_true', help='Use real UR3 arms (reads robot_config.json)')
     p.add_argument('--load-model',  type=str,   default=None,
                    help='DQN: path to .pt file; PPO: path without .zip extension')
     p.add_argument('--eval-only',   action='store_true')
@@ -61,6 +65,7 @@ def main():
             render=args.render,
             use_arm=args.arm or args.arm_gui,
             arm_gui=args.arm_gui,
+            use_real_arms=args.real_arms,
             load_model=args.load_model,
             eval_only=args.eval_only,
             save_dir=args.save_dir,

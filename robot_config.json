@@ -1,0 +1,19 @@
+{
+  "_comment": "Robot IPs and calibrated TCP poses for both UR3 arms.",
+  "_comment2": "Run tools/calibrate_arms.py to fill in the poses automatically.",
+  "_pose_format": "[x, y, z, rx, ry, rz]  — metres and axis-angle radians (UR convention)",
+
+  "joystick_arm": {
+    "ip": "192.168.1.2",
+    "_ip_note": "Change to your joystick UR3's IP address",
+    "home_pose": [0.300, 0.100, 0.250, 3.14, 0.0, 0.0],
+    "_pose_note": "TCP pose when joystick is perfectly centred — set by calibrate_arms.py"
+  },
+
+  "button_arm": {
+    "ip": "192.168.1.3",
+    "_ip_note": "Change to your button UR3's IP address",
+    "rest_pose": [0.300, 0.100, 0.250, 3.14, 0.0, 0.0],
+    "_pose_note": "TCP pose with finger just above the button surface — set by calibrate_arms.py"
+  }
+}

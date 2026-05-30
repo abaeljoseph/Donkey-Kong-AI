@@ -141,6 +141,7 @@ def train_ppo(
     render: bool          = False,
     use_arm: bool         = False,
     arm_gui: bool         = False,
+    use_real_arms: bool   = False,
     load_model: str       = None,
     eval_only: bool       = False,
     save_dir: str         = 'saved_models',
@@ -185,7 +186,13 @@ def train_ppo(
     else:
         vec_env = VecNormalize(raw_env, norm_obs=False, norm_reward=True, clip_reward=10.0)
 
-    arm     = RobotArm(gui=arm_gui) if use_arm else None
+    if use_real_arms:
+        from environment.real_robot_arm import RealRobotArms
+        arm = RealRobotArms()
+    elif use_arm:
+        arm = RobotArm(gui=arm_gui)
+    else:
+        arm = None
     metrics = MetricsTracker()
 
     callbacks = [
@@ -270,6 +277,8 @@ def train_ppo(
         best_ever_y, best_ever_ep = 999, 0
         while True:
             action, _ = model.predict(obs, deterministic=False)
+            if arm is not None:
+                arm.step(int(action[0]))
             obs, rewards, dones, infos = vec_env.step(action)
             ep_reward += float(rewards[0])
             mario_y = infos[0].get('mario_y', 999)
