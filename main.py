@@ -1,19 +1,19 @@
 """
 Entry point.
 
-DQN (default):
-    python main.py --episodes 1000
-    python main.py --episodes 2000 --render --num-envs 4
-    python main.py --load-model saved_models/dqn_ep500.pt
-    python main.py --eval-only --load-model saved_models/dqn_ep1000.pt --render
+Train headless (default):
+    python main.py --algo ppo --timesteps 10000000 --num-envs 8
 
-PPO (stable-baselines3, HD grade):
-    python main.py --algo ppo --timesteps 1000000
-    python main.py --algo ppo --timesteps 500000 --render
-    python main.py --algo ppo --timesteps 0 --load-model saved_models/ppo_final --eval-only
+Train and watch (ghost viewer + game window):
+    python main.py --algo ppo --timesteps 10000000 --num-envs 8 --render
 
-Robot arm GUI:
-    python main.py --arm-gui
+Continue training a checkpoint:
+    python main.py --algo ppo --timesteps 10000000 --num-envs 8 --load-model saved_models/ppo_5000000_steps
+
+Watch a saved model:
+    python main.py --algo ppo --eval-only --load-model saved_models/ppo_final --render --num-envs 1
+
+Robot arm:
     python main.py --algo ppo --arm-gui
 """
 
@@ -33,7 +33,6 @@ def parse_args():
     # PPO args
     p.add_argument('--timesteps',   type=int,   default=1_000_000, help='PPO: total env timesteps')
     p.add_argument('--ppo-save-freq', type=int, default=50_000,    help='PPO: checkpoint every N steps')
-    p.add_argument('--no-ghost',       action='store_true', help='Disable ghost viewer window')
     p.add_argument('--checkpoints',    action='store_true', help='Enable checkpoint spawning during training/eval')
     p.add_argument('--force-highest',  action='store_true', help='Always spawn at the highest saved checkpoint (implies --checkpoints)')
     # Shared
@@ -66,7 +65,7 @@ def main():
             eval_only=args.eval_only,
             save_dir=args.save_dir,
             save_freq=args.ppo_save_freq,
-            ghost_viewer=not args.no_ghost,
+            ghost_viewer=args.render,
             use_checkpoints=args.checkpoints or args.force_highest,
             force_highest=args.force_highest,
         )

@@ -272,6 +272,12 @@ class GhostViewerCallback(BaseCallback):
 
         self._best_env = int(np.argmax(self._ep_rewards))
 
+        # Sync broken zones from env 0 (detected per-episode in reset())
+        if infos:
+            bz = infos[0].get('_broken_zones')
+            if bz is not None:
+                self._broken_zones = bz
+
         # ── Background: full-res NES color frame from env 0 ─────────────
         raw_frame = infos[0].get('_raw_frame') if infos else None
         if raw_frame is not None:

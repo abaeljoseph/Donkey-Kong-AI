@@ -12,13 +12,28 @@ Run via main.py:
 import os
 import torch
 
+# PyTorch 2.6 changed torch.load default to weights_only=True, which blocks
+# numpy globals in checkpoints saved by older stable-baselines3.
+# Patch to restore weights_only=False for our own trusted checkpoints.
+_orig_torch_load = torch.load
+def _torch_load_compat(*args, **kwargs):
+    kwargs['weights_only'] = False
+    return _orig_torch_load(*args, **kwargs)
+torch.load = _torch_load_compat
+
+
+def _best_device():
+    if torch.cuda.is_available():
+        return 'cuda'
+    return 'cpu'
+
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
 from stable_baselines3.common.monitor import Monitor
 
 from environment.gym_wrapper import DonkeyKongGymEnv
-from environment.donkey_kong_env import MARIO_Y_START, auto_detect_broken_zones, auto_detect_all_ladders
+from environment.donkey_kong_env import MARIO_Y_START, auto_detect_all_ladders
 from environment.ghost_viewer import GhostViewerCallback
 from environment.pybullet_arm import RobotArm
 from evaluation.metrics import MetricsTracker
@@ -27,7 +42,7 @@ from evaluation.metrics import MetricsTracker
 CUSTOM_INTEGRATION_PATH = os.path.join(os.path.dirname(__file__), '..', 'retro_data')
 
 
-def _make_env_fn(render=False, rank=0, ghost_viewer=False, use_checkpoints=False, force_highest=False, broken_zones=None):
+def _make_env_fn(render=False, rank=0, ghost_viewer=False, use_checkpoints=False, force_highest=False):
     path = os.path.abspath(CUSTOM_INTEGRATION_PATH)
     def _fn():
         env = DonkeyKongGymEnv(
@@ -37,7 +52,6 @@ def _make_env_fn(render=False, rank=0, ghost_viewer=False, use_checkpoints=False
             provide_detect=ghost_viewer,
             use_checkpoints=use_checkpoints,
             force_highest=force_highest,
-            broken_zones=broken_zones,
         )
         return Monitor(env)
     return _fn
@@ -141,7 +155,6 @@ def train_ppo(
     torch.backends.cudnn.benchmark = True
 
     integration_path = os.path.abspath(CUSTOM_INTEGRATION_PATH)
-    broken_zones = auto_detect_broken_zones(integration_path)
     all_ladders  = auto_detect_all_ladders(integration_path)
 
     # Clear stale suspension flag from any previous run so envs don't start
@@ -153,15 +166,22 @@ def train_ppo(
         print('[Checkpoint] Cleared stale suspension flag from previous run')
 
     env_fns = [_make_env_fn(render=render, rank=i, ghost_viewer=ghost_viewer,
-                            use_checkpoints=use_checkpoints, force_highest=force_highest,
-                            broken_zones=broken_zones)
+                            use_checkpoints=use_checkpoints, force_highest=force_highest)
                for i in range(num_envs)]
     raw_env = SubprocVecEnv(env_fns)
 
     vecnorm_path = os.path.join(save_dir, 'vecnorm.pkl')
-    if load_model and os.path.exists(vecnorm_path):
-        vec_env = VecNormalize.load(vecnorm_path, raw_env)
-        vec_env.training = True
+    if not eval_only and load_model and os.path.exists(vecnorm_path):
+        try:
+            vec_env = VecNormalize.load(vecnorm_path, raw_env)
+            vec_env.training = True
+        except AssertionError:
+            raw_env.close()
+            raise SystemExit(
+                f'[Error] vecnorm.pkl obs shape does not match the current environment.\n'
+                f'        The model was trained with a different number of observation channels.\n'
+                f'        Delete saved_models/vecnorm.pkl if you want to start fresh reward normalisation.'
+            )
     else:
         vec_env = VecNormalize(raw_env, norm_obs=False, norm_reward=True, clip_reward=10.0)
 
@@ -183,18 +203,29 @@ def train_ppo(
 
     if ghost_viewer:
         callbacks.append(GhostViewerCallback(num_envs=num_envs,
-                                              all_ladders=all_ladders,
-                                              broken_zones=broken_zones))
+                                              all_ladders=all_ladders))
 
-    if load_model and os.path.exists(load_model + '.zip'):
+    if load_model:
+        if not os.path.exists(load_model + '.zip'):
+            vec_env.close()
+            raise SystemExit(f'[Error] Model not found: {load_model}.zip\n'
+                             f'        Check the path and try again.')
         print(f'Loading PPO checkpoint: {load_model}')
-        model = PPO.load(load_model, env=vec_env)
+        try:
+            model = PPO.load(load_model, env=vec_env, device=_best_device())
+        except (AssertionError, ValueError) as e:
+            vec_env.close()
+            raise SystemExit(
+                f'[Error] Model is incompatible with the current environment.\n'
+                f'        Likely cause: observation shape changed (e.g. OBS_CHANNELS).\n'
+                f'        Details: {e}'
+            )
         model.tensorboard_log = os.path.join(save_dir, 'tb_logs')
     else:
         model = PPO(
             policy='CnnPolicy',
             env=vec_env,
-            device='cpu',
+            device=_best_device(),
             policy_kwargs=dict(
                 normalize_images=False,
                 features_extractor_kwargs=dict(features_dim=512),

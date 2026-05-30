@@ -28,7 +28,7 @@ def plot_all_metrics(metrics: MetricsTracker, save_dir: str = 'results'):
         lo = max(0, i - window + 1)
         steps_window  = metrics.episode_steps[lo:i + 1]
         deaths_window = metrics.episode_deaths[lo:i + 1]
-        success_rates.append(sum(s > 2000 for s in steps_window) / len(steps_window))
+        success_rates.append(np.mean(metrics.episode_successes[lo:i + 1]))
         death_rates.append(np.mean(deaths_window))
 
     fig, axes = plt.subplots(3, 2, figsize=(14, 12))
@@ -47,7 +47,7 @@ def plot_all_metrics(metrics: MetricsTracker, save_dir: str = 'results'):
     # 2. Success rate
     ax = axes[0, 1]
     ax.plot(episodes, success_rates, color='green', linewidth=2)
-    ax.set_title('Success Rate (survived > 2000 steps)')
+    ax.set_title('Success Rate (reached Pauline)')
     ax.set_xlabel('Episode')
     ax.set_ylabel('Rate')
     ax.set_ylim(0, 1)
