@@ -1,130 +1,140 @@
 """
-Training loop — ties Person 1 (env), Person 2 (CNN), Person 3 (DQN) together.
-
-Usage:
-    python train.py                  # train from scratch
-    python train.py --resume checkpoints/model_ep500.pth
-
-Google Colab setup (run once before importing):
-    !pip install gym-retro torch opencv-python pybullet matplotlib
-    !python -m retro.import DonkeyKong-Nes.nes
+Training loop — vectorised multi-env DQN.
 """
 
-import argparse
 import os
-import sys
+import numpy as np
+import torch
+from tqdm import tqdm
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from environment import DonkeyKongEnv
-from models      import DQNAgent
-from evaluation  import MetricsTracker
-
-
-def train(num_episodes=1000, checkpoint_freq=100, checkpoint_dir='checkpoints',
-          resume=None, render=False, fresh_buffer=False):
-
-    os.makedirs(checkpoint_dir, exist_ok=True)
-
-    env     = DonkeyKongEnv(render=render)
-    agent   = DQNAgent(action_size=env.action_space_size)
-
-    # Auto-resume from the latest checkpoint if one exists
-    if resume is None:
-        existing = sorted([
-            f for f in os.listdir(checkpoint_dir)
-            if f.startswith('model_ep') and f.endswith('.pth')
-        ]) if os.path.isdir(checkpoint_dir) else []
-        if existing:
-            resume = os.path.join(checkpoint_dir, existing[-1])
-            print(f"Auto-resuming from {resume}")
-
-    start_episode = 1
-    if resume and os.path.exists(resume):
-        agent.load(resume)
-        # Parse episode number from filename so the count continues correctly
-        try:
-            start_episode = int(resume.split('model_ep')[1].replace('.pth', '')) + 1
-        except (IndexError, ValueError):
-            start_episode = agent.steps + 1
-        if fresh_buffer:
-            agent.fresh_buffer(epsilon=0.50)
-
-    metrics = MetricsTracker()
-    if os.path.exists('metrics.npz'):
-        metrics = MetricsTracker.load('metrics.npz')
-
-    print(f"\nTraining for {num_episodes} episodes  |  "
-          f"Actions: {env.action_space_size}  |  "
-          f"State: {env.state_shape}\n")
-
-    for episode in range(start_episode, start_episode + num_episodes):
-        state        = env.reset()
-        total_reward = 0.0
-        total_loss   = 0.0
-        loss_count   = 0
-        steps        = 0
-        done         = False
-        info         = {}
-
-        while not done:
-            action                        = agent.select_action(state)
-            next_state, reward, done, info = env.step(action)
-            agent.store(state, action, reward, next_state, done)
-
-            loss = agent.train_step()
-            if loss is not None:
-                total_loss += loss
-                loss_count += 1
-
-            state        = next_state
-            total_reward += reward
-            steps        += 1
-
-        agent.decay_epsilon()  # once per episode, not per step
-
-        avg_loss       = total_loss / loss_count if loss_count else 0.0
-        lives_remaining = info.get('lives', 0)
-
-        metrics.record(episode, total_reward, avg_loss, steps, lives_remaining)
-
-        if episode % 10 == 0:
-            print(
-                f"Ep {episode:5d} | "
-                f"Reward: {total_reward:8.2f} | "
-                f"Loss: {avg_loss:.5f} | "
-                f"Steps: {steps:5d} | "
-                f"ε: {agent.epsilon:.3f} | "
-                f"Lives: {lives_remaining}"
-            )
-
-        if episode % checkpoint_freq == 0:
-            ckpt_path = os.path.join(checkpoint_dir, f'model_ep{episode}.pth')
-            agent.save(ckpt_path)
-            metrics.save('metrics.npz')
-
-    env.close()
-    metrics.save('metrics.npz')
-    metrics.plot_all('training_metrics.png')
-    print("\nTraining complete.")
+from environment.donkey_kong_env import DonkeyKongEnv, NUM_ACTIONS
+from environment.pybullet_arm import RobotArm
+from models.dqn_agent import DQNAgent
+from training.vec_env import SubprocVecEnv
+from evaluation.metrics import MetricsTracker
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--episodes',        type=int,  default=5000)
-    parser.add_argument('--checkpoint-freq', type=int,  default=100)
-    parser.add_argument('--checkpoint-dir',  type=str,  default='checkpoints')
-    parser.add_argument('--resume',          type=str,  default=None)
-    parser.add_argument('--render',          action='store_true')
-    parser.add_argument('--fresh-buffer',    action='store_true',
-                        help='Keep model weights but wipe replay buffer and reset epsilon to 0.5')
-    args = parser.parse_args()
+CUSTOM_INTEGRATION_PATH = os.path.join(os.path.dirname(__file__), '..', 'retro_data')
 
-    train(
-        num_episodes     = args.episodes,
-        checkpoint_freq  = args.checkpoint_freq,
-        checkpoint_dir   = args.checkpoint_dir,
-        resume           = args.resume,
-        render           = args.render,
-        fresh_buffer     = args.fresh_buffer,
+
+def _make_env_fn(render=False):
+    path = os.path.abspath(CUSTOM_INTEGRATION_PATH)
+    def _fn():
+        return DonkeyKongEnv(render=render, custom_integration_path=path)
+    return _fn
+
+
+def train(
+    num_episodes: int   = 1000,
+    num_envs: int       = 4,
+    render: bool        = False,
+    arm_gui: bool       = False,
+    load_model: str     = None,
+    eval_only: bool     = False,
+    save_dir: str       = 'saved_models',
+    save_freq: int      = 100,
+) -> MetricsTracker:
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f'Using device: {device}')
+    print(f'Parallel envs: {num_envs}')
+
+    # Only render env 0
+    env_fns = [_make_env_fn(render=render) for i in range(num_envs)]
+    vec_env = SubprocVecEnv(env_fns)
+
+    arm     = RobotArm(gui=arm_gui)
+    agent   = DQNAgent(
+        num_actions=NUM_ACTIONS,
+        obs_shape=(4, 84, 84),
+        device=device,
     )
+    metrics = MetricsTracker()
+
+    if load_model and os.path.exists(load_model):
+        agent.load(load_model)
+        print(f'Loaded checkpoint: {load_model}')
+
+    # Per-env episode accumulators
+    ep_rewards = np.zeros(num_envs)
+    ep_steps   = np.zeros(num_envs, dtype=int)
+    ep_deaths  = np.zeros(num_envs, dtype=int)
+    ep_losses  = [[] for _ in range(num_envs)]
+    prev_lives = np.full(num_envs, 3)
+    episode_count = 0
+
+    states = vec_env.reset()   # (N, 4, 84, 84)
+
+    try:
+        pbar = tqdm(total=num_episodes, desc='Episodes')
+        while episode_count < num_episodes:
+
+            actions = agent.select_actions(states)   # (N,) — one batched forward pass
+            arm.step(int(actions[0]))                 # arm mirrors env-0
+
+            next_states, rewards, dones, infos = vec_env.step(actions)
+
+            for i in range(num_envs):
+                lives = infos[i].get('lives', prev_lives[i])
+                if lives < prev_lives[i]:
+                    ep_deaths[i] += 1
+                prev_lives[i] = lives
+
+                if not eval_only:
+                    loss = agent.observe(states[i], int(actions[i]),
+                                         float(rewards[i]), next_states[i], bool(dones[i]))
+                    if loss is not None:
+                        ep_losses[i].append(loss)
+
+                ep_rewards[i] += rewards[i]
+                ep_steps[i]   += 1
+
+                if dones[i]:
+                    avg_loss = float(np.mean(ep_losses[i])) if ep_losses[i] else 0.0
+                    metrics.log_episode(
+                        reward=float(ep_rewards[i]),
+                        steps=int(ep_steps[i]),
+                        deaths=int(ep_deaths[i]),
+                        loss=avg_loss,
+                        eps=agent.eps,
+                    )
+                    episode_count += 1
+                    pbar.update(1)
+
+                    ep_rewards[i] = 0.0
+                    ep_steps[i]   = 0
+                    ep_deaths[i]  = 0
+                    ep_losses[i]  = []
+                    prev_lives[i] = 3
+
+                    if episode_count % save_freq == 0 and not eval_only:
+                        path = os.path.join(save_dir, f'dqn_ep{episode_count}.pt')
+                        agent.save(path)
+
+                    if episode_count % 10 == 0:
+                        avg_r = np.mean(metrics.episode_rewards[-10:])
+                        pbar.set_postfix(avg_r=f'{avg_r:.1f}', eps=f'{agent.eps:.3f}')
+
+                    if episode_count % 20 == 0:
+                        from evaluation.plot_results import plot_all_metrics
+                        plot_all_metrics(metrics)   # overwrites results/training_metrics.png
+
+                    if episode_count >= num_episodes:
+                        break
+
+            states = next_states
+
+        pbar.close()
+
+    except KeyboardInterrupt:
+        print('\nInterrupted — saving checkpoint...')
+        if not eval_only and episode_count > 0:
+            path = os.path.join(save_dir, f'dqn_ep{episode_count}_interrupted.pt')
+            agent.save(path)
+            print(f'Saved → {path}')
+
+    finally:
+        vec_env.close()
+        arm.close()
+
+    return metrics

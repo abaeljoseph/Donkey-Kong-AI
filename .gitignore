@@ -1,33 +1,20 @@
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-.Python
-*.egg-info/
-dist/
-build/
-venv/
-.env
+# ROM — do NOT commit (copyright)
+*.nes
 
-# Editor
-.vscode/
-.idea/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# ML / training artifacts
-*.zip
-checkpoints/
+# Training outputs
 saved_models/
 results/
-runs/
-wandb/
+*.pt
+results/*.json
 
-# Data / media
-*.npz
-*.png
-*.jpg
-*.gif
+# Python
+__pycache__/
+*.pyc
+*.pyd
+.env
+
+# retro SHA (generated locally by setup_rom.py)
+retro_data/*/rom.sha
+
+.venv/
+stable-retro-src/

@@ -1,114 +1,98 @@
 """
-Person 3 — DQN Agent
-Decides which action to take based on the CNN's feature vector.
-
-Key components:
-  QNetwork     — CNN backbone + linear head outputting Q-values per action
-  ReplayBuffer — stores past transitions so training isn't correlated
-  DQNAgent     — ties it together: ε-greedy selection, training, checkpointing
+Person 3 — DQN agent.
+Implements epsilon-greedy action selection, Huber-loss training,
+and periodic target network synchronisation.
 """
 
+import os
 import random
-from collections import deque
-
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from .cnn import DonkeyKongCNN
-
-
-class QNetwork(nn.Module):
-    def __init__(self, action_size):
-        super().__init__()
-        self.cnn  = DonkeyKongCNN()
-        self.head = nn.Linear(self.cnn.output_dim, action_size)
-
-    def forward(self, x):
-        return self.head(self.cnn(x))
-
-
-class ReplayBuffer:
-    def __init__(self, capacity=50_000):
-        self.buffer = deque(maxlen=capacity)
-
-    def push(self, state, action, reward, next_state, done):
-        self.buffer.append((state, action, reward, next_state, done))
-
-    def sample(self, batch_size):
-        batch = random.sample(self.buffer, batch_size)
-        states, actions, rewards, next_states, dones = zip(*batch)
-        return (
-            np.array(states,      dtype=np.float32),
-            np.array(actions,     dtype=np.int64),
-            np.array(rewards,     dtype=np.float32),
-            np.array(next_states, dtype=np.float32),
-            np.array(dones,       dtype=np.float32),
-        )
-
-    def __len__(self):
-        return len(self.buffer)
+from models.cnn import DQNNetwork
+from training.replay_buffer import ReplayBuffer
 
 
 class DQNAgent:
     def __init__(
         self,
-        action_size,
-        lr=1e-4,
-        gamma=0.99,
-        epsilon_start=1.0,
-        epsilon_min=0.05,
-        epsilon_decay=0.998,
-        batch_size=32,
-        target_update_freq=1000,
-        buffer_capacity=20_000,
-        device=None,
+        num_actions: int,
+        obs_shape: tuple,
+        device: torch.device,
+        lr: float           = 1e-4,
+        gamma: float        = 0.99,
+        batch_size: int     = 32,
+        buffer_capacity: int = 100_000,
+        eps_start: float    = 1.0,
+        eps_end: float      = 0.01,
+        eps_decay_steps: int = 500_000,
+        target_update_freq: int = 1_000,
+        train_freq: int     = 4,
+        min_buffer: int     = 10_000,
     ):
-        self.action_size        = action_size
-        self.gamma              = gamma
-        self.epsilon            = epsilon_start
-        self.epsilon_min        = epsilon_min
-        self.epsilon_decay      = epsilon_decay
-        self.batch_size         = batch_size
+        self.num_actions    = num_actions
+        self.device         = device
+        self.gamma          = gamma
+        self.batch_size     = batch_size
+        self.eps            = eps_start
+        self.eps_end        = eps_end
+        self.eps_decay      = (eps_start - eps_end) / eps_decay_steps
         self.target_update_freq = target_update_freq
-        self.steps              = 0
+        self.train_freq     = train_freq
+        self.min_buffer     = min_buffer
+        self.step_count     = 0
 
-        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f"DQNAgent using device: {self.device}")
-
-        self.policy_net = QNetwork(action_size).to(self.device)
-        self.target_net = QNetwork(action_size).to(self.device)
-        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.online_net = DQNNetwork(num_actions).to(device)
+        self.target_net = DQNNetwork(num_actions).to(device)
+        self.target_net.load_state_dict(self.online_net.state_dict())
         self.target_net.eval()
 
-        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=lr)
-        self.loss_fn   = nn.SmoothL1Loss()  # Huber loss — more stable than MSE for DQN
-        self.buffer    = ReplayBuffer(buffer_capacity)
+        self.optimizer = optim.Adam(self.online_net.parameters(), lr=lr)
+        self.loss_fn   = nn.SmoothL1Loss()   # Huber loss
+        self.buffer    = ReplayBuffer(buffer_capacity, obs_shape)
 
     # ------------------------------------------------------------------
     # Action selection
     # ------------------------------------------------------------------
 
-    def select_action(self, state):
-        if random.random() < self.epsilon:
-            return random.randrange(self.action_size)
-        state_t = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+    def select_action(self, state: np.ndarray) -> int:
+        if random.random() < self.eps:
+            return random.randrange(self.num_actions)
         with torch.no_grad():
-            q_values = self.policy_net(state_t)
-        return q_values.argmax().item()
+            s = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            return int(self.online_net(s).argmax(dim=1).item())
+
+    def select_actions(self, states: np.ndarray) -> np.ndarray:
+        """Batch action selection for N parallel envs."""
+        n = len(states)
+        if random.random() < self.eps:
+            return np.array([random.randrange(self.num_actions) for _ in range(n)])
+        with torch.no_grad():
+            s = torch.FloatTensor(states).to(self.device)
+            return self.online_net(s).argmax(dim=1).cpu().numpy()
 
     # ------------------------------------------------------------------
     # Training
     # ------------------------------------------------------------------
 
-    def store(self, state, action, reward, next_state, done):
+    def observe(self, state, action, reward, next_state, done):
         self.buffer.push(state, action, reward, next_state, done)
+        self.step_count += 1
+        self.eps = max(self.eps_end, self.eps - self.eps_decay)
 
-    def train_step(self):
-        if len(self.buffer) < self.batch_size:
-            return None
+        loss = None
+        if (len(self.buffer) >= self.min_buffer and
+                self.step_count % self.train_freq == 0):
+            loss = self._train_step()
 
+        if self.step_count % self.target_update_freq == 0:
+            self.target_net.load_state_dict(self.online_net.state_dict())
+
+        return loss
+
+    def _train_step(self) -> float:
         states, actions, rewards, next_states, dones = self.buffer.sample(self.batch_size)
 
         states      = torch.FloatTensor(states).to(self.device)
@@ -117,58 +101,40 @@ class DQNAgent:
         next_states = torch.FloatTensor(next_states).to(self.device)
         dones       = torch.FloatTensor(dones).to(self.device)
 
-        current_q = self.policy_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+        # Current Q-values for chosen actions
+        q_values = self.online_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
 
+        # Target Q-values (no gradient)
         with torch.no_grad():
-            next_q   = self.target_net(next_states).max(1)[0]
-            target_q = rewards + self.gamma * next_q * (1 - dones)
+            max_next_q = self.target_net(next_states).max(dim=1)[0]
+            targets    = rewards + self.gamma * max_next_q * (1 - dones)
 
-        loss = self.loss_fn(current_q, target_q)
-
+        loss = self.loss_fn(q_values, targets)
         self.optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 10)
+        nn.utils.clip_grad_norm_(self.online_net.parameters(), 10.0)
         self.optimizer.step()
-
-        self.steps += 1
-
-        if self.steps % self.target_update_freq == 0:
-            self.target_net.load_state_dict(self.policy_net.state_dict())
 
         return loss.item()
 
-    def decay_epsilon(self):
-        # Called once per episode so exploration lasts across many episodes
-        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
-
     # ------------------------------------------------------------------
-    # Checkpointing
+    # Persistence
     # ------------------------------------------------------------------
 
-    def save(self, path):
+    def save(self, path: str):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         torch.save({
-            'policy_net': self.policy_net.state_dict(),
+            'online_net': self.online_net.state_dict(),
             'target_net': self.target_net.state_dict(),
             'optimizer':  self.optimizer.state_dict(),
-            'epsilon':    self.epsilon,
-            'steps':      self.steps,
+            'step_count': self.step_count,
+            'eps':        self.eps,
         }, path)
-        print(f"Checkpoint saved → {path}")
 
-    def load(self, path):
+    def load(self, path: str):
         ckpt = torch.load(path, map_location=self.device)
-        self.policy_net.load_state_dict(ckpt['policy_net'])
+        self.online_net.load_state_dict(ckpt['online_net'])
         self.target_net.load_state_dict(ckpt['target_net'])
         self.optimizer.load_state_dict(ckpt['optimizer'])
-        self.epsilon = ckpt['epsilon']
-        self.steps   = ckpt['steps']
-        print(f"Checkpoint loaded ← {path}  (step={self.steps}, ε={self.epsilon:.3f})")
-
-    def fresh_buffer(self, epsilon=0.5):
-        """Keep model weights but discard all replay experiences and reset epsilon.
-        Use this when the reward function changes — the network's visual knowledge
-        is still valid, but old transitions carry wrong reward values."""
-        capacity = self.buffer.buffer.maxlen
-        self.buffer  = ReplayBuffer(capacity)
-        self.epsilon = epsilon
-        print(f"Replay buffer cleared. ε reset to {epsilon:.2f} — retraining with new rewards.")
+        self.step_count = ckpt['step_count']
+        self.eps        = ckpt['eps']
