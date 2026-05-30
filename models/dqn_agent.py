@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from cnn import DonkeyKongCNN
+from .cnn import DonkeyKongCNN
 
 
 class QNetwork(nn.Module):

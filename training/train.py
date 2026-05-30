@@ -12,9 +12,12 @@ Google Colab setup (run once before importing):
 
 import argparse
 import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from environment import DonkeyKongEnv
-from dqn_agent   import DQNAgent
+from models      import DQNAgent
 from evaluation  import MetricsTracker
 
 

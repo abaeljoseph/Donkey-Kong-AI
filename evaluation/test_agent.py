@@ -7,12 +7,15 @@ Usage:
 """
 
 import argparse
+import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 
 from environment import DonkeyKongEnv
-from dqn_agent   import DQNAgent
+from models      import DQNAgent
 
 
 def test(checkpoint_path, num_episodes=5, render=True):
@@ -41,7 +44,6 @@ def test(checkpoint_path, num_episodes=5, render=True):
 
         lives   = info.get('lives', 0)
         score   = info.get('score', 0)
-        survived = steps > env.action_space_size  # basic sanity check
         results.append({'reward': total_reward, 'steps': steps,
                         'lives': lives, 'score': score})
 

@@ -12,12 +12,15 @@ Usage:
 """
 
 import sys
+import os
 import numpy as np
 import cv2
 import torch
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from environment import DonkeyKongEnv
-from dqn_agent import DQNAgent
+from models      import DQNAgent
 
 ACTION_NAMES = ['NOOP', 'RIGHT', 'LEFT', 'JUMP', 'R+JUMP', 'L+JUMP',
                 'UP', 'UP+R', 'UP+L', 'DOWN']

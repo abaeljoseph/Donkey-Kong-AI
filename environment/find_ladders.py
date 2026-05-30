@@ -7,9 +7,14 @@ Usage:
 """
 
 import argparse
+import os
+import sys
 import numpy as np
 from collections import defaultdict
-from environment import DonkeyKongEnv
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from environment.environment import DonkeyKongEnv
 
 def find_ladders(num_episodes=200):
     env = DonkeyKongEnv(render=False)
