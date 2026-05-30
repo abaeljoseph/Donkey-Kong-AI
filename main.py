@@ -43,6 +43,9 @@ def parse_args():
     p.add_argument('--render',      action='store_true', help='Render game window (env 0 only)')
     p.add_argument('--arm',         action='store_true', help='Enable PyBullet simulated arm')
     p.add_argument('--arm-gui',     action='store_true', help='Show PyBullet arm GUI (implies --arm)')
+    p.add_argument('--arm-renderer', type=str, default='pybullet',
+                   choices=['pybullet', 'software'],
+                   help='Arm GUI backend: pybullet OpenGL GUI or software Pygame viewer')
     p.add_argument('--real-arms',   action='store_true', help='Use real UR3 arms (reads robot_config.json)')
     p.add_argument('--load-model',  type=str,   default=None,
                    help='DQN: path to .pt file; PPO: path without .zip extension')
@@ -65,6 +68,7 @@ def main():
             render=args.render,
             use_arm=args.arm or args.arm_gui,
             arm_gui=args.arm_gui,
+            arm_renderer=args.arm_renderer,
             use_real_arms=args.real_arms,
             load_model=args.load_model,
             eval_only=args.eval_only,

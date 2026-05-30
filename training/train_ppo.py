@@ -141,6 +141,7 @@ def train_ppo(
     render: bool          = False,
     use_arm: bool         = False,
     arm_gui: bool         = False,
+    arm_renderer: str     = 'pybullet',
     use_real_arms: bool   = False,
     load_model: str       = None,
     eval_only: bool       = False,
@@ -190,7 +191,7 @@ def train_ppo(
         from environment.real_robot_arm import RealRobotArms
         arm = RealRobotArms()
     elif use_arm:
-        arm = RobotArm(gui=arm_gui)
+        arm = RobotArm(gui=arm_gui, software_viewer=(arm_gui and arm_renderer == 'software'))
     else:
         arm = None
     metrics = MetricsTracker()
@@ -277,9 +278,12 @@ def train_ppo(
         best_ever_y, best_ever_ep = 999, 0
         while True:
             action, _ = model.predict(obs, deterministic=False)
-            if arm is not None:
-                arm.step(int(action[0]))
             obs, rewards, dones, infos = vec_env.step(action)
+            if arm is not None:
+                raw_frame = infos[0].get('_raw_frame')
+                if raw_frame is not None and hasattr(arm, 'set_game_frame'):
+                    arm.set_game_frame(raw_frame)
+                arm.step(int(action[0]))
             ep_reward += float(rewards[0])
             mario_y = infos[0].get('mario_y', 999)
             lives   = infos[0].get('lives')

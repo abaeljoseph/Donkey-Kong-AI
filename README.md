@@ -380,6 +380,11 @@ Watch the AI play with both arms moving in a separate 3D window:
 python main.py --algo ppo --eval-only --load-model previous_archive/ppo59a_20m --num-envs 1 --arm-gui --render
 ```
 
+NO GPU:
+```bash 
+python main.py --algo ppo --eval-only --load-model previous_archive/ppo59a_20m --num-envs 1 --arm-gui --arm-renderer software --render
+```
+
 Watch arms only (no game window):
 
 ```bash
