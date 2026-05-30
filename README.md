@@ -354,6 +354,68 @@ This replaces all HSV colour scanning for hazard detection — OAM reads are ins
 
 ---
 
+## Robot Arms (Simulated)
+
+Two KUKA IIWA 7-DOF robot arms mirror what the AI is doing in real time:
+- **Left arm (blue)** — grips a joystick and tilts it left, right, forward or back to match the AI's directional input
+- **Right arm (orange)** — presses a button down whenever the AI jumps. The button turns red while held and yellow when released
+
+### Install the robot arm dependency
+
+```bash
+pip install pybullet
+```
+
+If `pybullet` is already in `requirements.txt` it will have been installed in Step 5. You can confirm with:
+
+```bash
+python -c "import pybullet; print('pybullet OK')"
+```
+
+### Run with robot arms
+
+Watch the AI play with both arms moving in a separate 3D window:
+
+```bash
+python main.py --algo ppo --eval-only --load-model previous_archive/ppo59a_20m --num-envs 1 --arm-gui --render
+```
+
+Watch arms only (no game window):
+
+```bash
+python main.py --algo ppo --eval-only --load-model previous_archive/ppo59a_20m --num-envs 1 --arm-gui
+```
+
+Train with arms running in the background (headless, no GUI):
+
+```bash
+python main.py --algo ppo --timesteps 10000000 --num-envs 8 --arm
+```
+
+### Robot arm flags
+
+| Flag | What it does |
+|---|---|
+| `--arm-gui` | Open the 3D PyBullet window showing both KUKA arms moving |
+| `--arm` | Run the arms headless (no window) — useful during training |
+
+### How the arms work
+
+Each AI action maps to a physical movement:
+
+| Action | Joystick arm | Button arm |
+|---|---|---|
+| NOOP | Joystick centred | Arm raised |
+| LEFT | Joystick tilts left | Arm raised |
+| RIGHT | Joystick tilts right | Arm raised |
+| UP | Joystick tilts forward | Arm raised |
+| DOWN | Joystick tilts back | Arm raised |
+| JUMP | Joystick centred | Presses button down |
+| JUMP + LEFT | Joystick tilts left | Presses button down |
+| JUMP + RIGHT | Joystick tilts right | Presses button down |
+
+---
+
 ## Project structure
 
 ```
@@ -361,6 +423,7 @@ environment/
   donkey_kong_env.py   # Core environment — reward, actions, OAM detection, frame processing
   gym_wrapper.py       # Wraps it for stable-baselines3
   ghost_viewer.py      # Live visualiser with height and reward charts
+  pybullet_arm.py      # Dual KUKA IIWA arm simulation driven by AI actions
 training/
   train_ppo.py         # Training and evaluation loop with model validation
 evaluation/
