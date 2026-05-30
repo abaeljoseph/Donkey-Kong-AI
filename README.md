@@ -461,3 +461,13 @@ saved_models/          # Where checkpoints are saved during training
 - The stage register (NES RAM address 83) cycles 1 → 3 → 4 → 1, not 1 → 2 → 3 — slot 2 is reserved and skipped by the ROM
 - Each time you continue training from a checkpoint, TensorBoard creates a new run line — the previous run's graph is preserved separately
 - If `height/mean` in TensorBoard is flat after 300k steps, check `environment/donkey_kong_env.py` — the reward signal may need tuning
+
+
+## Running the enviorment with Robot arms
+
+- Install:
+pip install pybullet
+
+Run (arms + game window together):
+python main.py --algo ppo --eval-only --load-model previous_archive/ppo59a_20m --num-envs 1 --arm-gui --render
+
