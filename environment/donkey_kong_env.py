@@ -30,7 +30,7 @@ JUMP_ACTIONS = frozenset({5, 6, 7})   # JUMP, JUMP+LEFT, JUMP+RIGHT
 FRAME_H      = 84
 FRAME_W      = 84
 FRAME_STACK  = 4
-OBS_CHANNELS = 7    # 4 grayscale + teal/ladder + barrel + fire
+OBS_CHANNELS = 7    # 4 grayscale + teal/ladder + barrel + fire  (set to 8 to add hammer — requires retraining from scratch)
 FRAME_SKIP   = 8    # hold each action for N frames
 MAX_STEPS    = 1200 # decision steps per episode (randomised ±200 per env to stagger resets)
 
@@ -132,7 +132,7 @@ def auto_detect_all_ladders(custom_integration_path=None):
         inttype = retro.data.Integrations.CUSTOM_ONLY
     else:
         inttype = retro.data.Integrations.DEFAULT
-    env = retro.make('DonkeyKong-Nes', state='1Player.GameA', inttype=inttype)
+    env = retro.make('DonkeyKong-Nes', state='1Player.GameA', inttype=inttype, render_mode=None)
     result = env.reset()
     obs = result[0] if isinstance(result, tuple) else result
     env.close()
@@ -157,6 +157,50 @@ def auto_detect_all_ladders(custom_integration_path=None):
             ))
     print(f'[Ladders] Detected {len(ladders)} ladder segments')
     return ladders
+
+
+def precompute_stage_maps(custom_integration_path=None):
+    """
+    Spin up one throwaway env, capture Stage 1's opening frame, and return:
+      teal_mask    — (84, 84) float32 binary mask of ladder pixels (ready to drop into channel 4)
+      broken_zones — list of (x0, y0, x1, y1) broken-ladder zones in NES coords
+
+    Call this ONCE in the main process before SubprocVecEnv is created.
+    Pass both values to each DonkeyKongEnv so reset() never has to re-scan —
+    the ladder layout and broken zones are identical every episode.
+    """
+    if custom_integration_path:
+        retro.data.Integrations.add_custom_path(custom_integration_path)
+        inttype = retro.data.Integrations.CUSTOM_ONLY
+    else:
+        inttype = retro.data.Integrations.DEFAULT
+    env = retro.make('DonkeyKong-Nes', state='1Player.GameA', inttype=inttype, render_mode=None)
+    result = env.reset()
+    obs = result[0] if isinstance(result, tuple) else result
+    env.close()
+
+    h, w = obs.shape[:2]
+    hsv  = cv2.cvtColor(obs, cv2.COLOR_RGB2HSV)
+
+    # Teal mask — same HSV range and resize as _extract_teal
+    raw_mask = cv2.inRange(hsv, np.array([83, 220, 190]), np.array([95, 255, 255]))
+    resized  = cv2.resize(raw_mask, (FRAME_W, FRAME_H), interpolation=cv2.INTER_NEAREST)
+    teal_mask = (resized > 0).astype(np.float32)
+
+    # Broken zones
+    raw = detect_broken_ladder_zones(hsv, h, w)
+    if raw:
+        broken_zones = [
+            (int(z[0] * 256 / w), int(z[1] * 224 / h),
+             int(z[2] * 256 / w), int(z[3] * 224 / h))
+            for z in raw
+        ]
+    else:
+        broken_zones = list(BROKEN_LADDER_ZONES)
+
+    print(f'[StageMaps] Teal pixels: {int(teal_mask.sum())}, '
+          f'broken zones: {len(broken_zones)}: {broken_zones}')
+    return teal_mask, broken_zones
 
 
 def auto_detect_broken_zones(custom_integration_path=None):
@@ -210,7 +254,7 @@ class DonkeyKongEnv:
     def __init__(self, render=False, custom_integration_path=None,
                  provide_frame=False, provide_detect=False,
                  use_checkpoints=False, force_highest=False,
-                 broken_zones=None):
+                 static_teal_mask=None, broken_zones=None):
         if custom_integration_path:
             retro.data.Integrations.add_custom_path(custom_integration_path)
             inttype = retro.data.Integrations.CUSTOM_ONLY
@@ -227,9 +271,11 @@ class DonkeyKongEnv:
         self.action_space_n = NUM_ACTIONS
         self.observation_shape = (OBS_CHANNELS, FRAME_H, FRAME_W)
 
-        self._use_checkpoints = use_checkpoints
-        self._force_highest   = force_highest
-        self._broken_zones    = broken_zones if broken_zones is not None else list(BROKEN_LADDER_ZONES)
+        self._use_checkpoints   = use_checkpoints
+        self._force_highest     = force_highest
+        # Static maps computed once at startup — if provided, reset() skips HSV scanning entirely.
+        self._static_teal_mask  = static_teal_mask
+        self._static_broken_zones = broken_zones  # None means detect dynamically at reset
         self._provide_frame   = provide_frame
         self._provide_detect = provide_detect
         self._frames        = collections.deque(maxlen=FRAME_STACK)
@@ -240,6 +286,7 @@ class DonkeyKongEnv:
         self._last_teal     = np.zeros((FRAME_H, FRAME_W), dtype=np.float32)
         self._last_barrel   = np.zeros((FRAME_H, FRAME_W), dtype=np.float32)
         self._last_fire     = np.zeros((FRAME_H, FRAME_W), dtype=np.float32)
+        self._last_hammer   = np.zeros((FRAME_H, FRAME_W), dtype=np.float32)
         self._max_steps        = MAX_STEPS
         self._reset_mario_y    = MARIO_Y_START
         self._best_y           = MARIO_Y_START
@@ -313,43 +360,52 @@ class DonkeyKongEnv:
             chosen_pos = random.choices(range(len(pool)), [w / total for _, _, w in pool], k=1)[0]
             chosen_idx, chosen, _ = pool[chosen_pos]
         self._last_checkpoint_idx = chosen_idx
-        actual_lives = 3
         _noop = [0, 0, 0, 0, 0, 0, 0, 0, 0]
         if chosen is not None:
             self.env.em.set_state(chosen)
             for _ in range(4):
                 result = self.env.step(_noop)
             obs, _, _, _, noop_info = result
-            actual_lives = noop_info.get('lives', 3)
         else:
-            # 1Player.GameA starts with a ~150-frame intro animation where no input
-            # is accepted. Advance past it so the policy has control from frame 1.
-            for _ in range(200):
-                result = self.env.step(_noop)
-            obs, _, _, _, noop_info = result
-            actual_lives = noop_info.get('lives', 3)
+            noop_info = result[4] if len(result) > 4 else {}
+            obs = result[0]
 
         self._start_stage  = noop_info.get('stage', 0)
-        self._prev_lives   = actual_lives
+        self._prev_lives   = noop_info.get('lives', 3)
         self._prev_mario_y = MARIO_Y_START
         self._step_count   = 0
         self._max_steps    = MAX_STEPS + random.randint(-200, 200)
 
-        h, w      = obs.shape[:2]
-        hsv       = cv2.cvtColor(obs, cv2.COLOR_RGB2HSV)
-        gray      = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
-        small     = cv2.resize(obs, (DETECT_W, DETECT_H))
-        small_hsv = cv2.cvtColor(small, cv2.COLOR_RGB2HSV)
-        sh, sw    = small.shape[:2]
+        gray = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
+        ram  = np.frombuffer(self.env.get_ram(), dtype=np.uint8)
 
-        self._prev_mario_x, self._prev_mario_y = self._detect_mario(small_hsv, sh, sw)
+        self._prev_mario_x, self._prev_mario_y = self._detect_mario_oam(ram)
         self._reset_mario_y = self._prev_mario_y
         self._ep_best_y     = self._prev_mario_y
 
+        if self._static_teal_mask is not None:
+            # Static maps precomputed at startup — no HSV scan needed.
+            self._last_teal    = self._static_teal_mask
+            self._broken_zones = self._static_broken_zones
+        else:
+            # Dynamic scan fallback (debug tool, or future multi-stage support).
+            h, w = obs.shape[:2]
+            hsv  = cv2.cvtColor(obs, cv2.COLOR_RGB2HSV)
+            detected_raw = detect_broken_ladder_zones(hsv, h, w)
+            if detected_raw:
+                self._broken_zones = [
+                    (int(z[0] * 256 / w), int(z[1] * 224 / h),
+                     int(z[2] * 256 / w), int(z[3] * 224 / h))
+                    for z in detected_raw
+                ]
+            else:
+                self._broken_zones = list(BROKEN_LADDER_ZONES)
+            self._last_teal = self._extract_teal(hsv)
+
         frame = self._preprocess_gray(gray)
-        self._last_teal   = self._extract_teal(hsv)
-        self._last_barrel = self._extract_barrel(hsv, h, w)
-        self._last_fire   = self._extract_fire(hsv, h, w)
+        self._last_barrel = self._extract_barrel_oam(ram)
+        self._last_fire   = self._extract_fire_oam(ram)
+        self._last_hammer = self._extract_hammer_oam(ram)
         for _ in range(FRAME_STACK):
             self._frames.append(frame)
 
@@ -366,58 +422,53 @@ class DonkeyKongEnv:
 
         self._step_count += 1
 
-        # Precompute colour conversions once — shared by all detection and extraction methods.
-        # Previously each method did its own cvtColor; this eliminates 6 redundant conversions
-        # and 1 redundant resize per step.
-        h, w      = obs.shape[:2]
-        hsv       = cv2.cvtColor(obs, cv2.COLOR_RGB2HSV)
-        gray      = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
-        small     = cv2.resize(obs, (DETECT_W, DETECT_H))
-        small_hsv = cv2.cvtColor(small, cv2.COLOR_RGB2HSV)
-        sh, sw    = small.shape[:2]
+        gray  = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
+        small = cv2.resize(obs, (DETECT_W, DETECT_H))
+        ram   = np.frombuffer(self.env.get_ram(), dtype=np.uint8)
 
-        self._last_teal   = self._extract_teal(hsv)
-        self._last_barrel = self._extract_barrel(hsv, h, w)
-        self._last_fire   = self._extract_fire(hsv, h, w)
+        self._last_barrel = self._extract_barrel_oam(ram)
+        self._last_fire   = self._extract_fire_oam(ram)
+        self._last_hammer = self._extract_hammer_oam(ram)
         self._frames.append(self._preprocess_gray(gray))
 
         lives    = info.get('lives',    self._prev_lives)
         gameover = info.get('gameover', 0)
         stage    = info.get('stage',    self._start_stage)
         level    = info.get('level',    0)
-        level_changed = (stage != self._start_stage)
-        mario_x, mario_y = self._detect_mario(small_hsv, sh, sw)
+        mario_x, mario_y = self._detect_mario_oam(ram)
 
-        barrel_penalty, barrel_at_level = self._barrel_proximity_penalty(hsv, mario_y, h)
-        fire_penalty                    = self._fire_proximity_penalty(hsv, mario_y, h)
-        oil_can_penalty                 = self._oil_can_penalty(mario_x, mario_y)
+        barrel_penalty, barrel_at_level = self._barrel_proximity_penalty_oam(mario_y, ram)
+        fire_penalty                    = self._fire_proximity_penalty_oam(mario_y, ram)
         dy_this_step                    = self._prev_mario_y - mario_y
-        is_new_ep_height                = mario_y < self._ep_best_y
-        self._ep_best_y                 = min(self._ep_best_y, mario_y)
-        ladder_bonus                    = self._ladder_climbing_bonus(hsv, action_idx, mario_y, h, dy_this_step, is_new_ep_height)
-        ladder_approach                 = self._intact_ladder_proximity_bonus(hsv, mario_x, mario_y, h, w)
+        old_ep_best_y                   = self._ep_best_y
+        mario_cx = mario_x + 8   # OAM X is left edge of 16px sprite; use centre for zone test
+        mario_cy = mario_y + 8
         in_broken_zone = any(
-            z[0] <= mario_x <= z[2] and z[1] <= mario_y <= z[3]
+            z[0] <= mario_cx <= z[2] and z[1] <= mario_cy <= z[3]
             for z in self._broken_zones
         )
-        broken_ladder_penalty = -50.0 if (action_idx == 3 and in_broken_zone) else 0.0
 
-        # Only count barrels that are at Mario's level (not above on a higher platform)
-        # as jump-relevant danger. Barrels above still apply their proximity penalty
-        # but should not unlock the height-reward unsuppression for jumping.
-        danger_nearby = barrel_at_level or fire_penalty < -0.01
+        self._ep_best_y = min(self._ep_best_y, mario_y)
+        if in_broken_zone and action_idx == 3:
+            # Pressing UP through a broken ladder: suppress the active climbing bonus
+            # but still credit height gained — climbing through is still possible but
+            # always less rewarding than an intact ladder (no active bonus).
+            ladder_bonus          = 0.3   # passive only
+            broken_ladder_penalty = -2.0
+        else:
+            ladder_bonus          = self._ladder_climbing_bonus(action_idx, dy_this_step)
+            broken_ladder_penalty = 0.0
+        height_ref_y = old_ep_best_y
 
         # New height record — save checkpoint only when standing on a platform (not a ladder).
         # _best_y is only advanced when we actually save, so if Mario is on a ladder at the
         # threshold height, we keep retrying until he's standing on the platform proper.
         if self._use_checkpoints and mario_y < self._best_y and mario_y > MARIO_Y_WIN and lives >= self._prev_lives and not gameover:
-            cx0 = int(max(0,   mario_x - 20) * w / 256)
-            cx1 = max(cx0 + 1, int(min(256, mario_x + 20) * w / 256))
-            fy0 = int(mario_y * h / 224)
-            fy1 = max(fy0 + 1, min(int((mario_y + 16) * h / 224), h))
-            on_ladder = cv2.countNonZero(cv2.inRange(
-                hsv[fy0:fy1, cx0:cx1],
-                np.array([83, 220, 190]), np.array([95, 255, 255]))) >= 2
+            tx0 = max(0, int((mario_x - 20) * FRAME_W / 256))
+            tx1 = min(FRAME_W, int((mario_x + 20) * FRAME_W / 256))
+            ty0 = max(0, int(mario_y * FRAME_H / 224))
+            ty1 = min(FRAME_H, int((mario_y + 16) * FRAME_H / 224) + 1)
+            on_ladder = np.any(self._last_teal[ty0:ty1, tx0:tx1] > 0)
             if not on_ladder:
                 self._best_y = mario_y   # advance only on a successful save
                 state = None
@@ -474,15 +525,16 @@ class DonkeyKongEnv:
             else:
                 self._checkpoint_fail_streak[idx] = 0
 
-        height_mult = 1.0 if (action_idx not in JUMP_ACTIONS or danger_nearby) else 0.0
+        reward, won = self._compute_reward(lives, mario_y, gameover, height_ref_y)
+        reward += barrel_penalty + fire_penalty + ladder_bonus + broken_ladder_penalty
 
-        reward, won = self._compute_reward(lives, mario_y, gameover, height_mult)
-        won = won or level_changed   # stage register changed → Mario beat level 1
-        reward += barrel_penalty + fire_penalty + oil_can_penalty + ladder_bonus + ladder_approach + broken_ladder_penalty
-        if action_idx in JUMP_ACTIONS and not danger_nearby:
-            reward -= 0.15
+        done = bool(gameover) or won or self._step_count >= self._max_steps
 
-        done = bool(gameover) or won or self._step_count >= self._max_steps or lives < self._prev_lives
+        # Reset height tracker when a life is lost so each new life gets the same
+        # reward signal as the first — otherwise later lives have no height headroom
+        # and the model learns to play differently depending on which life it's on.
+        if lives < self._prev_lives:
+            self._ep_best_y = MARIO_Y_START
 
         self._prev_lives   = lives
         self._prev_mario_y = mario_y
@@ -492,6 +544,7 @@ class DonkeyKongEnv:
         info['_level']        = level
         info['_step_reward']  = reward
         info['_won']          = won
+        info['_broken_zones'] = self._broken_zones
 
         # Full-res color frame for ghost viewer background — throttled to reduce pipe load
         if self._provide_frame and self._step_count % FRAME_SEND_EVERY == 0:
@@ -510,54 +563,64 @@ class DonkeyKongEnv:
     # Internals
     # ------------------------------------------------------------------
 
-    def _detect_mario(self, small_hsv, sh, sw):
-        """
-        Detect Mario's (x, y) NES position from a precomputed small HSV frame.
-        Falls back to previous values if detection fails.
-        """
-        skin = cv2.inRange(small_hsv, np.array([  0,  45, 215]), np.array([ 12, 110, 255]))
-        blue = cv2.inRange(small_hsv, np.array([115, 230, 130]), np.array([125, 255, 210]))
-        red  = cv2.inRange(small_hsv, np.array([  0, 200, 180]), np.array([ 12, 255, 240]))
+    def _detect_mario_oam(self, ram):
+        """Detect Mario's NES position from OAM shadow (slots 0-3). Falls back to previous."""
+        xs, ys = [], []
+        for s in range(4):
+            sy = int(ram[512 + s * 4])
+            sx = int(ram[512 + s * 4 + 3])
+            if sy < 0xEF and sx > 0:
+                ys.append(sy); xs.append(sx)
+        if xs:
+            mario_y = int(min(ys) * 224 / 240)
+            mario_x = int(min(xs))
+            return mario_x, mario_y
+        return self._prev_mario_x, self._prev_mario_y
 
-        hud_cut = int(sh * 0.106)
-        skin[:hud_cut, :] = 0; blue[:hud_cut, :] = 0; red[:hud_cut, :] = 0
-        dy0, dy1 = int(sh * 0.078), int(sh * 0.254)
-        dx1 = int(sw * 0.322)
-        skin[dy0:dy1, :dx1] = 0; blue[dy0:dy1, :dx1] = 0; red[dy0:dy1, :dx1] = 0
+    def _barrel_proximity_penalty_oam(self, mario_y, ram):
+        """Penalty when a barrel (OAM slots 12-51, groups of 4) is within 15 NES px."""
+        barrel_ys = []
+        for g in range(10):
+            sy = int(ram[512 + (12 + g * 4) * 4])
+            if sy < 0xEF:
+                barrel_ys.append(int(sy * 224 / 240))
+        if not barrel_ys:
+            return 0.0, False
+        dists = np.abs(np.array(barrel_ys, dtype=float) - mario_y)
+        closest_idx = int(dists.argmin())
+        closest = float(dists[closest_idx])
+        if closest < 15:
+            proximity_factor = 1.0 - (closest / 15.0)
+            at_level = float(barrel_ys[closest_idx]) >= mario_y - 8
+            return -0.2 * proximity_factor, at_level
+        return 0.0, False
 
-        k = np.ones((14, 14), np.uint8)
-        region = cv2.bitwise_and(cv2.dilate(skin, k),
-                 cv2.bitwise_and(cv2.dilate(blue, k), cv2.dilate(red, k)))
-        pixels = cv2.bitwise_and(skin, region)
-
-        ys, xs = np.where(pixels > 0)
-        if len(ys) < 2:
-            return self._prev_mario_x, self._prev_mario_y
-        mario_y_nes = int(np.median(ys) * 224 / sh)
-        mario_x_nes = int(np.median(xs) * 256 / sw)
-        return mario_x_nes, mario_y_nes
-
-    def _ladder_climbing_bonus(self, hsv, action_idx, mario_y, h, dy, is_new_ep_height):
-        """
-        +3.0 bonus for actively climbing an intact ladder to a new episode height.
-        Gated on is_new_ep_height so Mario cannot farm by oscillating up-down on
-        the same ladder section — the bonus only fires at each new personal best.
-        """
-        if not is_new_ep_height:
+    def _fire_proximity_penalty_oam(self, mario_y, ram):
+        """Penalty when fire (OAM slots 4-7 or 8-11) is within 20 NES px of Mario."""
+        fire_ys = []
+        for base in (4, 8):
+            sy = int(ram[512 + base * 4])
+            if sy < 0xEF:
+                fire_ys.append(int(sy * 224 / 240))
+        if not fire_ys:
             return 0.0
-        hud_offset = int(h * 0.1)
-        region_hsv = hsv[hud_offset:, :]
-        teal = cv2.inRange(region_hsv, np.array([83, 220, 190]), np.array([95, 255, 255]))
+        closest = float(min(abs(fy - mario_y) for fy in fire_ys))
+        if closest < 20:
+            return -0.2 * (1.0 - closest / 20.0)
+        return 0.0
 
-        if action_idx == 3 and dy > 0 and cv2.countNonZero(teal) > 80:
-            mario_y_px = int(mario_y * h / 224) - hud_offset
-            # Check only 2–20px above Mario — working ladder rails are immediately
-            # adjacent, broken ladder teal starts above the gap further up.
-            above_top  = max(0, mario_y_px - 20)
-            above_bot  = max(0, mario_y_px - 2)
-            teal_above = cv2.countNonZero(teal[above_top:above_bot, :]) if above_bot > above_top else 0
-            if teal_above >= 5:
-                return 3.0
+    def _ladder_climbing_bonus(self, action_idx, dy):
+        """
+        +0.5 for actively climbing (UP + moving up + teal visible).
+        Small enough that cycling up-down gives only ~+0.10/step over idling, which the
+        height reward (+3 to +10 per new pixel) completely dominates — no farming incentive.
+        +0.3 passive when teal is visible — keeps the AI near ladders.
+        """
+        teal_count = int(np.count_nonzero(self._last_teal))
+        if action_idx == 3 and dy > 0 and teal_count > 10:
+            return 0.5
+        if teal_count > 10:
+            return 0.3
         return 0.0
 
     def _barrel_proximity_penalty(self, hsv, mario_y, h):
@@ -657,22 +720,65 @@ class DonkeyKongEnv:
         resized = cv2.resize(mask, (FRAME_W, FRAME_H), interpolation=cv2.INTER_NEAREST)
         return (resized > 0).astype(np.float32)
 
-    def _extract_barrel(self, hsv, h, w):
-        """Binary barrel channel: 1.0 where barrel orange pixels are."""
-        mask = cv2.inRange(hsv, np.array([10, 160, 220]), np.array([25, 215, 255]))
-        # Exclude DK zone (stacked barrels at top-left are not in play)
-        dk_y0 = int(h * 0.078); dk_y1 = int(h * 0.254); dk_x1 = int(w * 0.322)
-        mask[dk_y0:dk_y1, :dk_x1] = 0
-        resized = cv2.resize(mask, (FRAME_W, FRAME_H), interpolation=cv2.INTER_NEAREST)
-        return (resized > 0).astype(np.float32)
+    def _extract_barrel_oam(self, ram):
+        """Barrel channel: paint sprite footprint for each active barrel (OAM slots 12-51)."""
+        canvas = np.zeros((FRAME_H, FRAME_W), dtype=np.float32)
+        for g in range(10):
+            xs, ys = [], []
+            for s in range(4):
+                slot = 12 + g * 4 + s
+                sy = int(ram[512 + slot * 4])
+                sx = int(ram[512 + slot * 4 + 3])
+                if sy < 0xEF and sx > 0:
+                    ys.append(sy); xs.append(sx)
+            if not xs:
+                continue
+            px = int(min(xs) * FRAME_W / 256)
+            py = int(min(ys) * FRAME_H / 240)
+            r = 4
+            canvas[max(0, py - r):min(FRAME_H, py + r),
+                   max(0, px - r):min(FRAME_W, px + r)] = 1.0
+        return canvas
 
-    def _extract_fire(self, hsv, h, w):
-        """Binary fire channel: 1.0 where fire/fireball pixels are."""
-        mask = cv2.inRange(hsv, np.array([12, 50, 220]), np.array([25, 130, 255]))
-        dk_y0 = int(h * 0.078); dk_y1 = int(h * 0.254); dk_x1 = int(w * 0.322)
-        mask[dk_y0:dk_y1, :dk_x1] = 0
-        resized = cv2.resize(mask, (FRAME_W, FRAME_H), interpolation=cv2.INTER_NEAREST)
-        return (resized > 0).astype(np.float32)
+    def _extract_fire_oam(self, ram):
+        """Fire channel: paint sprite footprint for each active fire group (OAM slots 4-11)."""
+        canvas = np.zeros((FRAME_H, FRAME_W), dtype=np.float32)
+        for base in (4, 8):
+            xs, ys = [], []
+            for s in range(4):
+                slot = base + s
+                sy = int(ram[512 + slot * 4])
+                sx = int(ram[512 + slot * 4 + 3])
+                if sy < 0xEF and sx > 0:
+                    ys.append(sy); xs.append(sx)
+            if not xs:
+                continue
+            px = int(min(xs) * FRAME_W / 256)
+            py = int(min(ys) * FRAME_H / 240)
+            r = 4
+            canvas[max(0, py - r):min(FRAME_H, py + r),
+                   max(0, px - r):min(FRAME_W, px + r)] = 1.0
+        return canvas
+
+    def _extract_hammer_oam(self, ram):
+        """Hammer channel: paint sprite footprint for each active hammer (OAM slots 52-55)."""
+        canvas = np.zeros((FRAME_H, FRAME_W), dtype=np.float32)
+        for base in (52, 54):
+            xs, ys = [], []
+            for s in range(2):
+                slot = base + s
+                sy = int(ram[512 + slot * 4])
+                sx = int(ram[512 + slot * 4 + 3])
+                if sy < 0xEF and sx > 0:
+                    ys.append(sy); xs.append(sx)
+            if not xs:
+                continue
+            px = int(min(xs) * FRAME_W / 256)
+            py = int(min(ys) * FRAME_H / 240)
+            r = 4
+            canvas[max(0, py - r):min(FRAME_H, py + r),
+                   max(0, px - r):min(FRAME_W, px + r)] = 1.0
+        return canvas
 
     def _get_state(self):
         gray_stack = np.array(self._frames, dtype=np.float32)   # (4, H, W)
@@ -680,26 +786,30 @@ class DonkeyKongEnv:
         barrel = self._last_barrel[np.newaxis]                   # (1, H, W) barrels
         fire   = self._last_fire  [np.newaxis]                   # (1, H, W) fires
         return np.concatenate([gray_stack, teal, barrel, fire], axis=0)  # (7, H, W)
+        # To enable hammer channel (8 channels), add hammer[np.newaxis] and set OBS_CHANNELS=8
 
     def _oil_can_penalty(self, mario_x, mario_y):
-        """Penalty for approaching the oil can (bottom-left, fixed NES position). Kills on contact."""
-        OIL_X, OIL_Y = 28, 200
-        dist = ((mario_x - OIL_X) ** 2 + (mario_y - OIL_Y) ** 2) ** 0.5
-        if dist < 40:
-            return -1.0 * (1.0 - dist / 40.0)   # up to -1.0 at contact
+        """Penalty for approaching the oil can (bottom-left, fixed NES position). Kills on contact.
+        Uses horizontal distance only — oil can is a ground hazard so jumping up doesn't escape it."""
+        OIL_X = 28
+        OIL_RADIUS = 60   # widened from 40 — zone now starts at x≈88, well before the oil can
+        OIL_MAX_Y = 210   # only penalise when on or near the ground floor
+        if mario_y < OIL_MAX_Y:
+            x_dist = abs(mario_x - OIL_X)
+            if x_dist < OIL_RADIUS:
+                return -3.0 * (1.0 - x_dist / OIL_RADIUS)
         return 0.0
 
-    def _compute_reward(self, lives, mario_y, gameover, height_mult=1.0):
+    def _compute_reward(self, lives, mario_y, gameover, old_ep_best_y):
         reward = 0.0
 
-        dy = self._prev_mario_y - mario_y   # positive = climbed upward
-
-        # Height reward scales with how high Mario already is:
-        # near bottom each pixel = 3pts, near top each pixel = 10pts
-        # height_mult = 0 suppresses this for pointless jumps (no danger nearby)
+        # Progress-only height reward: only pay for NEW height reached this step.
+        # Revisiting old ground gives nothing, so farming the same ladder segment
+        # is unprofitable — every idle step costs the time penalty with no offset.
+        new_height_px = max(0.0, old_ep_best_y - mario_y)
         height_progress = max(0.0, min(1.0, (MARIO_Y_START - mario_y) / TOTAL_HEIGHT))
         climb_scale = 3.0 + height_progress * 7.0
-        reward += dy * climb_scale * height_mult
+        reward += new_height_px * climb_scale
 
         # Win — bonus scales with how fast Mario finished
         won = mario_y <= MARIO_Y_WIN
@@ -707,7 +817,7 @@ class DonkeyKongEnv:
             reward += 500.0 + (self._max_steps - self._step_count) * 0.5
 
         # Time penalty — discourages idling and hesitation
-        reward -= 0.1
+        reward -= 0.05
 
         # Death: small penalty — risk-taking to climb should be acceptable
         if lives < self._prev_lives:
