@@ -5,6 +5,7 @@ maps a small discrete action set, and computes a shaped reward.
 """
 
 import collections
+import json
 import os
 import random
 import numpy as np
@@ -34,6 +35,9 @@ OBS_CHANNELS = 7    # 4 grayscale + teal/ladder + barrel + fire  (set to 8 to ad
 FRAME_SKIP   = 8    # hold each action for N frames
 MAX_STEPS    = 1200 # decision steps per episode (randomised ±200 per env to stagger resets)
 
+GAME_NAME  = 'DonkeyKongOriginalEdition-Nes'
+GAME_STATE = '1Player.GameA'
+
 # Donkey Kong NES level 1: Mario starts near Y=176, princess is near Y=22.
 # Y decreases as Mario climbs (NES screen origin is top-left).
 MARIO_Y_START = 176
@@ -60,6 +64,28 @@ BROKEN_LADDER_ZONES = [
 # Directory where platform game-states are persisted to disk.
 # All subprocesses share the same files so one env's discovery benefits the rest.
 GAMESTATE_DIR = os.path.join(os.path.dirname(__file__), '..', 'saved_models', 'gamestates')
+
+# Stage 4 rivet positions — detected by colour from the opening frame and cached.
+RIVET_POSITIONS_PATH = os.path.join(
+    os.path.dirname(__file__), '..', 'saved_models', 'stage_starts', 'stage_4_rivets.json')
+
+# Stage 4 rivet colour (small orange studs on girders, much smaller area than barrels).
+STAGE4_RIVET_HSV_LO   = np.array([10, 120, 120])
+STAGE4_RIVET_HSV_HI   = np.array([30, 255, 255])
+_STAGE4_RIVET_CHECK_R = 5   # pixel radius of the window used to detect rivet disappearance
+
+# Per-stage cache versions.  Bump a stage's value to force only that stage to rescan.
+# Stage 3 is at 5: forces rescan after the MORPH_CLOSE kernel was widened to bridge
+#   the fireball gap.  Stage 4 is at 5: forces rescan after the secondary colour pass
+#   exclusion and aspect-ratio fixes.
+_LADDER_CACHE_VERSIONS = {1: 2, 2: 3, 3: 5, 4: 5}
+
+# Per-stage ladder position cache.  Scanned ONCE on first encounter, then loaded from
+# disk every subsequent run.  Delete the file to force a fresh scan.
+def _ladder_cache_path(stage: int) -> str:
+    return os.path.join(
+        os.path.dirname(__file__), '..', 'saved_models', 'stage_starts',
+        f'stage_{stage}_ladders.json')
 
 
 def _gamestate_path(i: int) -> str:
@@ -115,24 +141,26 @@ def detect_broken_ladder_zones(hsv, h, w):
             if min(ax + aw, bx + bw) - max(ax, bx) < MIN_X_OVL:
                 continue
             zones.append((
-                int(min(ax, bx)),
+                int(min(ax, bx)) + 1,
                 int(ay),
-                int(max(ax+aw, bx+bw)),
+                int(max(ax+aw, bx+bw)) + 1,
                 int(by + bh),
             ))
     return zones
 
-def auto_detect_all_ladders(custom_integration_path=None):
+def auto_detect_all_ladders(custom_integration_path=None, game_name=None, game_state=None):
     """
     Capture one clean frame and return all ladder segment positions as NES coords.
     Returns list of (nes_x0, nes_y0, nes_x1, nes_y1).
     """
+    game_name  = game_name  or GAME_NAME
+    game_state = game_state or GAME_STATE
     if custom_integration_path:
         retro.data.Integrations.add_custom_path(custom_integration_path)
         inttype = retro.data.Integrations.CUSTOM_ONLY
     else:
         inttype = retro.data.Integrations.DEFAULT
-    env = retro.make('DonkeyKong-Nes', state='1Player.GameA', inttype=inttype, render_mode=None)
+    env = retro.make(game_name, state=game_state, inttype=inttype, render_mode=None)
     result = env.reset()
     obs = result[0] if isinstance(result, tuple) else result
     env.close()
@@ -159,7 +187,7 @@ def auto_detect_all_ladders(custom_integration_path=None):
     return ladders
 
 
-def precompute_stage_maps(custom_integration_path=None):
+def precompute_stage_maps(custom_integration_path=None, game_name=None, game_state=None):
     """
     Spin up one throwaway env, capture Stage 1's opening frame, and return:
       teal_mask    — (84, 84) float32 binary mask of ladder pixels (ready to drop into channel 4)
@@ -169,12 +197,14 @@ def precompute_stage_maps(custom_integration_path=None):
     Pass both values to each DonkeyKongEnv so reset() never has to re-scan —
     the ladder layout and broken zones are identical every episode.
     """
+    game_name  = game_name  or GAME_NAME
+    game_state = game_state or GAME_STATE
     if custom_integration_path:
         retro.data.Integrations.add_custom_path(custom_integration_path)
         inttype = retro.data.Integrations.CUSTOM_ONLY
     else:
         inttype = retro.data.Integrations.DEFAULT
-    env = retro.make('DonkeyKong-Nes', state='1Player.GameA', inttype=inttype, render_mode=None)
+    env = retro.make(game_name, state=game_state, inttype=inttype, render_mode=None)
     result = env.reset()
     obs = result[0] if isinstance(result, tuple) else result
     env.close()
@@ -203,19 +233,21 @@ def precompute_stage_maps(custom_integration_path=None):
     return teal_mask, broken_zones
 
 
-def auto_detect_broken_zones(custom_integration_path=None):
+def auto_detect_broken_zones(custom_integration_path=None, game_name=None, game_state=None):
     """
     Spin up a throwaway retro env, grab one frame, run detect_broken_ladder_zones,
     and convert the result to NES coords. Called once in the main process before
     SubprocVecEnv is created so subprocesses never need to re-run it.
     Falls back to BROKEN_LADDER_ZONES if nothing is detected.
     """
+    game_name  = game_name  or GAME_NAME
+    game_state = game_state or GAME_STATE
     if custom_integration_path:
         retro.data.Integrations.add_custom_path(custom_integration_path)
         inttype = retro.data.Integrations.CUSTOM_ONLY
     else:
         inttype = retro.data.Integrations.DEFAULT
-    env = retro.make('DonkeyKong-Nes', state='1Player.GameA', inttype=inttype)
+    env = retro.make(game_name, state=game_state, inttype=inttype)
     result = env.reset()
     obs = result[0] if isinstance(result, tuple) else result
     env.close()
@@ -254,7 +286,14 @@ class DonkeyKongEnv:
     def __init__(self, render=False, custom_integration_path=None,
                  provide_frame=False, provide_detect=False,
                  use_checkpoints=False, force_highest=False,
-                 static_teal_mask=None, broken_zones=None):
+                 static_teal_mask=None, broken_zones=None,
+                 game_name=None, game_state=None):
+        _game_name  = game_name  or GAME_NAME
+        _game_state = game_state or GAME_STATE
+        # 'none' sentinel = boot ROM from scratch without loading a save state.
+        # Used when no valid state file exists for the ROM (e.g. OE before recording one).
+        if _game_state == 'none':
+            _game_state = retro.State.NONE
         if custom_integration_path:
             retro.data.Integrations.add_custom_path(custom_integration_path)
             inttype = retro.data.Integrations.CUSTOM_ONLY
@@ -262,8 +301,8 @@ class DonkeyKongEnv:
             inttype = retro.data.Integrations.DEFAULT
 
         self.env = retro.make(
-            game='DonkeyKong-Nes',
-            state='1Player.GameA',
+            game=_game_name,
+            state=_game_state,
             inttype=inttype,
             render_mode='human' if render else None,
         )
@@ -283,7 +322,13 @@ class DonkeyKongEnv:
         self._prev_mario_y  = MARIO_Y_START
         self._prev_mario_x  = 128
         self._step_count    = 0
-        self._last_teal     = np.zeros((FRAME_H, FRAME_W), dtype=np.float32)
+        self._last_teal       = np.zeros((FRAME_H, FRAME_W), dtype=np.float32)
+        self._ladder_rects    = []   # (x0,y0,x1,y1) in screen pixels, updated once per stage
+        self._ladder_template = None  # grayscale tile patch extracted from stage 1 ladder
+        self._rescan_pending  = False # True after stage change; fires when Mario spawns at bottom
+        self._rivet_positions   = []   # (x,y) frame pixel coords of rivets, detected at stage 4 start
+        self._rivet_popped      = set() # VISUAL indices into _rivet_positions that have been collected
+        self._rivet_game_popped = set() # GAME indices (0-7, = 0xC1+i) already assigned to visual slots
         self._last_barrel   = np.zeros((FRAME_H, FRAME_W), dtype=np.float32)
         self._last_fire     = np.zeros((FRAME_H, FRAME_W), dtype=np.float32)
         self._last_hammer   = np.zeros((FRAME_H, FRAME_W), dtype=np.float32)
@@ -370,8 +415,15 @@ class DonkeyKongEnv:
             noop_info = result[4] if len(result) > 4 else {}
             obs = result[0]
 
-        self._start_stage  = noop_info.get('stage', 0)
-        self._prev_lives   = noop_info.get('lives', 3)
+        self._start_stage   = noop_info.get('stage', 0)
+        self._current_stage = self._start_stage
+        # Fallback: env.reset() returns (obs, info) — 2 values, not 5 — so noop_info
+        # is {} when no checkpoint was loaded, leaving stage = 0. Read from RAM instead.
+        if self._current_stage == 0:
+            _ram = np.frombuffer(self.env.get_ram(), dtype=np.uint8)
+            self._current_stage = int(_ram[83]) or 1
+            self._start_stage   = self._current_stage
+        self._prev_lives    = noop_info.get('lives', 3)
         self._prev_mario_y = MARIO_Y_START
         self._step_count   = 0
         self._max_steps    = MAX_STEPS + random.randint(-200, 200)
@@ -401,6 +453,8 @@ class DonkeyKongEnv:
             else:
                 self._broken_zones = list(BROKEN_LADDER_ZONES)
             self._last_teal = self._extract_teal(hsv)
+            # Build ladder display rects for stage 1
+            self._rescan_stage_maps(obs)
 
         frame = self._preprocess_gray(gray)
         self._last_barrel = self._extract_barrel_oam(ram)
@@ -435,7 +489,42 @@ class DonkeyKongEnv:
         gameover = info.get('gameover', 0)
         stage    = info.get('stage',    self._start_stage)
         level    = info.get('level',    0)
+
+        # On stage change, arm the pending flag — don't rescan yet because the transition
+        # animation plays before the new layout is on-screen.  Fire only when Mario
+        # appears at the bottom of the stage (OAM Y ≥ 150), which means he has spawned
+        # in and the new stage background is fully drawn.
+        if stage != self._current_stage and stage != 0:
+            self._current_stage = stage
+            self._rescan_pending = True
+
+        if self._rescan_pending:
+            _oam_y = int(ram[512])   # OAM slot 0 Y; 0xFF/0xEF+ = off-screen
+            if 150 <= _oam_y < 0xEF:
+                self._rescan_pending = False
+                self._rescan_stage_maps(raw_obs)
+
         mario_x, mario_y = self._detect_mario_oam(ram)
+
+        # Stage 4: track rivet collection via the per-rivet state bytes 0xC1–0xC8.
+        # Each byte is 0=intact, 1=collected.  When byte i flips 0→1, find the
+        # nearest uncollected visual position and assign it.  When bytes flip back
+        # to 0 (stage restart / game-over), clear everything.
+        # Rivets persist through deaths in DK NES — no death reset needed.
+        if self._current_stage == 4 and self._rivet_positions:
+            _any_reset = False
+            for _gi in range(8):
+                _byte = int(ram[0xC1 + _gi])
+                if _byte == 1 and _gi not in self._rivet_game_popped:
+                    self._rivet_game_popped.add(_gi)
+                    if _gi < len(self._rivet_positions):
+                        self._rivet_popped.add(_gi)
+                elif _byte == 0 and _gi in self._rivet_game_popped:
+                    _any_reset = True
+            if _any_reset:
+                # Bytes reverted to 0 → stage restarted from scratch
+                self._rivet_popped      = set()
+                self._rivet_game_popped = set()
 
         barrel_penalty, barrel_at_level = self._barrel_proximity_penalty_oam(mario_y, ram)
         fire_penalty                    = self._fire_proximity_penalty_oam(mario_y, ram)
@@ -535,6 +624,9 @@ class DonkeyKongEnv:
         # and the model learns to play differently depending on which life it's on.
         if lives < self._prev_lives:
             self._ep_best_y = MARIO_Y_START
+            # Rivets reset on death in stage 4.  No explicit reset needed here because
+            # step() already detects it: when 0xC1-C8 bytes revert from 1→0 after a
+            # death, _any_reset fires and clears both popped sets.
 
         self._prev_lives   = lives
         self._prev_mario_y = mario_y
@@ -713,6 +805,431 @@ class DonkeyKongEnv:
     def _preprocess_gray(self, gray):
         resized = cv2.resize(gray, (FRAME_W, FRAME_H), interpolation=cv2.INTER_AREA)
         return resized.astype(np.float32) / 255.0
+
+    def _rescan_stage_maps(self, obs):
+        """Load cached ladder positions (or scan once and cache) for the current stage.
+
+        Cache files live in saved_models/stage_starts/stage_N_ladders.json.
+        Delete a file to force a fresh scan for that stage.
+        The 4→1 level-rollover bug is fixed automatically: stage 1's cache is written
+        at game start, so the rollover just loads from file instead of rescanning.
+        """
+        stage      = self._current_stage
+        cache_path = _ladder_cache_path(stage)
+        h, w       = obs.shape[:2]   # needed by _teal_from_rects regardless of cache path
+
+        _cache_ok = False
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path) as _f:
+                    _data = json.load(_f)
+                _expected_ver = _LADDER_CACHE_VERSIONS.get(stage, max(_LADDER_CACHE_VERSIONS.values()))
+                if _data.get('version', 1) < _expected_ver:
+                    print(f'[Stage {stage}] Cache outdated (v{_data.get("version",1)} < {_expected_ver}) — rescanning')
+                    os.remove(cache_path)
+                else:
+                    rects = [tuple(r) for r in _data.get('rects', [])]
+                    if stage == 1 and 'broken_zones' in _data:
+                        self._broken_zones = [tuple(z) for z in _data['broken_zones']]
+                    else:
+                        self._broken_zones = [] if stage != 1 else list(BROKEN_LADDER_ZONES)
+                    print(f'[Stage {stage}] Loaded {len(rects)} ladder rects from cache')
+                    _cache_ok = True
+            except (json.JSONDecodeError, KeyError, ValueError) as _e:
+                print(f'[Stage {stage}] Cache file corrupt ({_e}) — deleting and rescanning')
+                os.remove(cache_path)
+
+        if not _cache_ok:
+            # ── Cache miss: detect from frame and save ────────────────────────
+            hsv  = cv2.cvtColor(obs, cv2.COLOR_RGB2HSV)
+            gray = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
+
+            # Broken zones (stage 1 only)
+            if stage == 1:
+                _raw_bz = detect_broken_ladder_zones(hsv, h, w)
+                self._broken_zones = (
+                    [(int(z[0]*256/w), int(z[1]*224/h),
+                      int(z[2]*256/w), int(z[3]*224/h)) for z in _raw_bz]
+                    if _raw_bz else list(BROKEN_LADDER_ZONES)
+                )
+            else:
+                self._broken_zones = []
+
+            # Stage 4: detect rivets BEFORE ladders so we can clip ladder rects that
+            # overlap rivet positions.  Short "top stub" ladders sit at the same x
+            # columns as the adjacent rivets — clipping is the only reliable fix.
+            _s4_rivets_for_clip = []
+            if stage == 4:
+                if os.path.exists(RIVET_POSITIONS_PATH):
+                    with open(RIVET_POSITIONS_PATH) as _rf:
+                        _s4_rivets_for_clip = [tuple(p) for p in json.load(_rf)]
+                else:
+                    _s4_rivets_for_clip = self._scan_rivets_from_frame(obs)
+                    if _s4_rivets_for_clip:
+                        os.makedirs(os.path.dirname(RIVET_POSITIONS_PATH), exist_ok=True)
+                        with open(RIVET_POSITIONS_PATH, 'w') as _rf:
+                            json.dump([[int(x), int(y)] for x, y in _s4_rivets_for_clip], _rf)
+
+            rects = self._detect_ladders_color(gray, hsv, h, w, stage)
+
+            if stage == 4 and _s4_rivets_for_clip:
+                rects = DonkeyKongEnv._clip_stage4_ladders(rects, _s4_rivets_for_clip)
+
+            if rects:
+                # Convert numpy int32 → Python int so JSON can serialise them
+                _save = {'version': _LADDER_CACHE_VERSIONS.get(stage, max(_LADDER_CACHE_VERSIONS.values())),
+                         'rects': [[int(v) for v in r] for r in rects]}
+                if stage == 1:
+                    _save['broken_zones'] = [[int(v) for v in z]
+                                             for z in self._broken_zones]
+                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                with open(cache_path, 'w') as _f:
+                    json.dump(_save, _f)
+                print(f'[Stage {stage}] Detected {len(rects)} ladder rects → saved to cache')
+            else:
+                print(f'[Stage {stage}] Detection returned 0 rects — running diagnostic')
+                self._print_color_diagnostic(hsv, h, w, stage)
+
+        # ── Stage 4 rivets ────────────────────────────────────────────────────
+        if stage == 4:
+            self._rivet_popped      = set()
+            self._rivet_game_popped = set()
+            # Pre-populate from save state: if any 0xC1-C8 bytes are already 1,
+            # mark those game indices as popped and assign visual index = game index
+            # (best possible without a live Mario position to guide nearest-match).
+            _s4_ram = np.frombuffer(self.env.get_ram(), dtype=np.uint8)
+            for _gi in range(8):
+                if int(_s4_ram[0xC1 + _gi]) == 1:
+                    self._rivet_game_popped.add(_gi)
+                    if _gi < len(self._rivet_positions):
+                        self._rivet_popped.add(_gi)
+            if os.path.exists(RIVET_POSITIONS_PATH):
+                with open(RIVET_POSITIONS_PATH) as _f:
+                    self._rivet_positions = [tuple(p) for p in json.load(_f)]
+                print(f'[Stage 4] {len(self._rivet_positions)} rivet positions loaded from cache')
+            else:
+                self._rivet_positions = self._scan_rivets_from_frame(obs)
+                if self._rivet_positions:
+                    os.makedirs(os.path.dirname(RIVET_POSITIONS_PATH), exist_ok=True)
+                    with open(RIVET_POSITIONS_PATH, 'w') as _f:
+                        json.dump([[int(x), int(y)] for x, y in self._rivet_positions], _f)
+                    print(f'[Stage 4] Saved {len(self._rivet_positions)} rivet positions')
+                else:
+                    print('[Stage 4] No rivets detected from frame — delete cache to retry')
+        else:
+            self._rivet_positions = []
+            self._rivet_popped    = set()
+
+        self._ladder_rects = rects
+        self._last_teal    = self._teal_from_rects(rects, h, w)
+        print(f'[Stage {stage}] {len(rects)} ladder segments, '
+              f'{len(self._broken_zones)} broken zones')
+
+    @staticmethod
+    def _detect_ladders_color(gray, hsv, h, w, stage):
+        """
+        Colour-based ladder detection.  Called only on cache miss (first encounter).
+
+        Stage 1   — teal HSV [75,60,80]→[110,255,255] (original, working).
+        Stage 2   — white: HSV S<65, V>130 + horizontal dilation to merge rails,
+                    vertical close to bridge rung gaps; falls back to rung-counting.
+        Stage 3   — teal with wider S floor (30 vs 60) + morphological close to
+                    capture the full bottom section of each ladder.
+        Stage 4   — rung-counting (Sobel-Y, colour-independent) as primary;
+                    yellow/amber HSV [12,80,80]→[45,255,255] as fallback.
+
+        Returns a list of (x0,y0,x1,y1) rects in the frame's pixel space.
+        """
+        if stage == 1:
+            mask = cv2.inRange(hsv, np.array([75, 60, 80]), np.array([110, 255, 255]))
+            mask[:int(h * 0.10), :]              = 0
+            mask[int(h * 0.85):, :int(w * 0.20)] = 0
+            return DonkeyKongEnv._rects_from_mask(mask)
+
+        elif stage == 2:
+            # White ladders: low saturation, high value.
+            # No bottom exclusion — stage 2 has no oil-can; rely on aspect ratio only.
+            raw = cv2.inRange(hsv, np.array([0, 0, 130]), np.array([179, 65, 255]))
+            raw[:int(h * 0.10), :] = 0
+            # Two-pass approach: dilate into a connectivity mask to merge the two side rails
+            # and bridge rung gaps, but compute TIGHT bounding boxes from the original raw
+            # mask so returned rects hug actual pixels rather than the inflated envelope.
+            conn = cv2.dilate(raw, np.ones((1, 8), np.uint8))
+            conn = cv2.morphologyEx(conn, cv2.MORPH_CLOSE, np.ones((5, 1), np.uint8))
+            n_labels, labels = cv2.connectedComponents(conn, connectivity=8)
+            rects = []
+            for lbl in range(1, n_labels):
+                in_comp = (labels == lbl) & (raw > 0)
+                ys, xs = np.where(in_comp)
+                if len(ys) < 10:
+                    continue
+                x0, y0 = int(xs.min()), int(ys.min())
+                x1, y1 = int(xs.max()) + 1, int(ys.max()) + 1
+                bh, bw = y1 - y0, x1 - x0
+                if bh > 12 and bw < 45 and bh > 1.5 * bw:
+                    rects.append((x0, y0, x1, y1))
+            if not rects:
+                rects = DonkeyKongEnv._detect_ladders_by_rungs(gray, h, w)
+            return rects
+
+        elif stage == 3:
+            # Teal ladders — lower S floor catches dim rungs near the ladder bottom.
+            # Close BEFORE applying exclusions: MORPH_CLOSE = dilate+erode, and if the
+            # HUD zone is zeroed first, the erode step eats the top pixels of any ladder
+            # that touches the boundary. Closing on the full mask then clearing the HUD
+            # preserves those top pixels.
+            # Kernel height 17 (8px reach each side) bridges a ~15px fireball gap so
+            # the full ladder rect is captured even if a fireball obscures part of it
+            # at scan time.
+            mask = cv2.inRange(hsv, np.array([75, 30, 60]), np.array([110, 255, 255]))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((17, 3), np.uint8))
+            mask[:int(h * 0.10), :]              = 0
+            mask[int(h * 0.85):, :int(w * 0.20)] = 0
+            return DonkeyKongEnv._rects_from_mask(mask)
+
+        elif stage == 4:
+            # Primary: rung-counting (colour-independent, separates ladders from girders).
+            rects = DonkeyKongEnv._detect_ladders_by_rungs(gray, h, w)
+            # Trim 2 pixels from each horizontal edge so ladder boxes don't overlap
+            # adjacent rivet positions.
+            rects = [(x0 + 4, y0 + 2, x1 - 4, y1 - 2) for x0, y0, x1, y1 in rects
+                     if x1 - x0 > 10 and y1 - y0 > 6]
+            # Secondary: colour-based pass to pick up short sections (< 20 px tall)
+            # that the rung detector's height filter discards.
+            # No bottom-left exclusion — stage 4 has no oil can there, and the
+            # bottom-left stub ladder sits in that area.
+            # Aspect ratio ≥ 2.0 (height must be at least 2× width) to prevent
+            # orange rivet blobs (roughly square) from being mistaken for ladders.
+            col_mask = cv2.inRange(hsv, np.array([12, 80, 80]), np.array([45, 255, 255]))
+            col_mask[:int(h * 0.10), :] = 0  # HUD only
+            col_mask = cv2.dilate(col_mask, np.ones((2, 3), np.uint8))
+            for cr in DonkeyKongEnv._rects_from_mask(col_mask):
+                bh = cr[3] - cr[1];  bw = cr[2] - cr[0]
+                if bh < 8 or bw >= 40 or bh < 2.0 * bw:
+                    continue
+                cx = (cr[0] + cr[2]) / 2;  cy = (cr[1] + cr[3]) / 2
+                if any(r[0] <= cx <= r[2] and r[1] <= cy <= r[3] for r in rects):
+                    continue   # already covered by rung detector
+                rects.append(cr)
+            return rects
+
+        return []
+
+    @staticmethod
+    def _rects_from_mask(mask):
+        n, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        rects = []
+        for i in range(1, n):
+            if stats[i, cv2.CC_STAT_AREA] < 15:
+                continue
+            lx = stats[i, cv2.CC_STAT_LEFT]
+            ly = stats[i, cv2.CC_STAT_TOP]
+            lw = stats[i, cv2.CC_STAT_WIDTH]
+            lh = stats[i, cv2.CC_STAT_HEIGHT]
+            rects.append((lx, ly, lx + lw, ly + lh))
+        return rects
+
+    @staticmethod
+    def _detect_ladders_by_rungs(gray, h, w):
+        """
+        Find ladder bounding boxes by counting horizontal Sobel edges per column.
+
+        Ladders have many short rung edges stacked vertically; platform girders have only
+        1-2 long horizontal edges per column.  Columns with >= MIN_RUNG_ROWS horizontal
+        edges that span a narrow x-range are collected as a ladder segment.
+        Works for any ladder colour (white, yellow, teal, etc.).
+        """
+        sobel_y = cv2.Sobel(gray.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)
+        edges   = (np.abs(sobel_y) > 12).astype(np.uint8)
+        edges[:int(h * 0.10), :]              = 0   # exclude HUD
+        edges[int(h * 0.85):, :int(w * 0.20)] = 0   # exclude oil-can corner
+
+        col_density = edges.sum(axis=0)   # edge-row count per column
+
+        rects    = []
+        in_group = False
+        x0       = 0
+        for x in range(w + 1):
+            active = x < w and col_density[x] >= 5
+            if active and not in_group:
+                in_group = True;  x0 = x
+            elif not active and in_group:
+                in_group = False;  x1 = x
+                if x1 - x0 >= 35:          # too wide — platform girder, not a ladder
+                    continue
+                col_edges = edges[:, x0:x1]
+                full_row  = edges.sum(axis=1).astype(np.float32)
+                col_sum   = col_edges.sum(axis=1).astype(np.float32)
+                # Keep only rows where ≥30 % of the frame-wide edges fall inside
+                # this column group — platform girders span the full frame width so
+                # their rows have a very low in-column fraction and get filtered out.
+                mask_rows = np.where(
+                    (col_sum > 0) & (col_sum / np.where(full_row > 0, full_row, 1) >= 0.30)
+                )[0]
+                rows = mask_rows
+                if len(rows) < 5 or rows[-1] - rows[0] < 20:
+                    continue               # too few rung rows or too short
+                rects.append((x0, int(rows[0]), x1, int(rows[-1])))
+        return rects
+
+    @staticmethod
+    def _print_color_diagnostic(hsv, h, w, stage):
+        """
+        Called when ladder detection returns 0 rects.
+        Reports both white/grey pixel counts AND the dominant saturated hues so the
+        developer can see the actual ladder colour and adjust the HSV range.
+        Note: white pixels have S<30 so they do NOT appear in the hue histogram —
+        check the 'white pixels' line separately.
+        """
+        roi = hsv[int(h * 0.12):int(h * 0.85), int(w * 0.05):int(w * 0.95)]
+        bright = roi[:, :, 2] > 60
+
+        # White/near-white pixels: bright AND low saturation
+        white_px = int(np.sum(bright & (roi[:, :, 1] < 40)))
+        print(f'[Stage {stage} DIAG] No ladders found.')
+        print(f'  White/grey pixels (S<40, V>60): {white_px}  '
+              f'{"← ladder candidate" if white_px > 200 else "← very few, ladders not white"}')
+
+        # Saturated hues
+        sat  = roi[:, :, 1] > 40
+        hues = roi[:, :, 0][bright & sat]
+        if hues.size > 0:
+            counts = np.bincount(hues.astype(np.int32), minlength=180)
+            top    = sorted(enumerate(counts), key=lambda x: -x[1])[:6]
+            print('  Top saturated hue bins (H in OpenCV 0-179 = 0-358°):')
+            names  = {range(0,10):'red/orange', range(10,25):'orange', range(25,35):'yellow',
+                      range(35,75):'green',      range(75,100):'teal',  range(100,130):'blue',
+                      range(130,160):'purple',    range(160,180):'red'}
+            for hval, cnt in top:
+                nm = next((v for k, v in names.items() if hval in k), '?')
+                print(f'    H={hval:3d} ({nm}): {cnt} px')
+        print('  Fix: for white ladders use gray>155; '
+              'for coloured ladders use inRange([H-5,80,80],[H+5,255,255])')
+
+    def _detect_ladders_by_template(self, gray, h, w):
+        """Find ladder tiles using normalised cross-correlation — colour-independent."""
+        tmpl = self._ladder_template
+        res  = cv2.matchTemplate(gray.astype(np.float32), tmpl, cv2.TM_CCOEFF_NORMED)
+        match_mask = (res >= 0.72).astype(np.uint8)
+        # Dilate to merge adjacent tile hits into one segment
+        match_mask = cv2.dilate(match_mask, np.ones((8, 4), np.uint8))
+        match_mask[:int(h * 0.10), :]              = 0
+        match_mask[int(h * 0.85):, :int(w * 0.20)] = 0
+        return self._rects_from_mask(match_mask)
+
+    @staticmethod
+    def _clip_stage4_ladders(rects, rivet_positions, margin=3):
+        """Shrink any stage 4 ladder rect whose x-range contains a rivet position.
+
+        Horizontal clip: pushes the nearer x-edge past the rivet so the ladder
+        channel doesn't mark rivet columns as climbable.
+
+        Vertical clip: rivets sit at platform level and produce concentrated
+        Sobel edges that score 100 % column-fraction, bypassing the row filter.
+        If a rivet falls inside the outer 25 % of the ladder rect's height, push
+        the nearer y-edge past it so the rect stops at the actual rung area.
+        """
+        VERT_M = 3
+        out = []
+        for x0, y0, x1, y1 in rects:
+            lx0, lx1 = x0, x1
+            ly0, ly1 = y0, y1
+            for rx, ry in rivet_positions:
+                if not (x0 <= rx <= x1):   # check against original x-span
+                    continue
+                # Horizontal clip
+                if ly0 <= ry <= ly1:
+                    cx = (lx0 + lx1) / 2
+                    if rx < cx:
+                        lx0 = int(rx) + margin
+                    else:
+                        lx1 = int(rx) - margin
+                # Vertical clip — only when rivet is in the outer 25 % of height
+                rect_h = ly1 - ly0
+                if rect_h > 0:
+                    if ry < ly0 + rect_h * 0.25:
+                        ly0 = max(ly0, int(ry) + VERT_M)
+                    elif ry > ly1 - rect_h * 0.25:
+                        ly1 = min(ly1, int(ry) - VERT_M)
+            if lx1 - lx0 > 4 and ly1 - ly0 > 15:
+                out.append((int(lx0), int(ly0), int(lx1), int(ly1)))
+        return out
+
+    @staticmethod
+    def _teal_from_rects(rects, src_h, src_w):
+        """Build the 84×84 ladder channel from pre-computed bounding boxes."""
+        canvas = np.zeros((FRAME_H, FRAME_W), dtype=np.float32)
+        for (x0, y0, x1, y1) in rects:
+            # Convert from source screen coords to 84×84 canvas
+            cx0 = int(x0 * FRAME_W / src_w);  cx1 = int(x1 * FRAME_W / src_w)
+            cy0 = int(y0 * FRAME_H / src_h);  cy1 = int(y1 * FRAME_H / src_h)
+            canvas[cy0:cy1, cx0:cx1] = 1.0
+        return canvas
+
+    def _scan_rivets_from_frame(self, obs):
+        """Detect stage 4 rivet positions from the opening frame.
+        Rivets are small orange studs (3-50 px area) on the girders — much smaller
+        than rolling barrels (100-500 px), so area filter cleanly separates them.
+        Returns list of (x, y) in frame pixel coords, capped at 8.
+        """
+        h, w = obs.shape[:2]
+        hsv  = cv2.cvtColor(obs, cv2.COLOR_RGB2HSV)
+        mask = cv2.inRange(hsv, STAGE4_RIVET_HSV_LO, STAGE4_RIVET_HSV_HI)
+        # Stage 4: DK + Pauline sit at the TOP CENTRE of the stage (unlike stage 1
+        # where DK is upper-left).  Exclude the top 22% full-width to clear both the
+        # HUD strip and the DK/Pauline sprite area above the first platform.
+        mask[:int(h * 0.22), :] = 0
+        mask[int(h * 0.85):, :int(w * 0.20)] = 0  # oil-can corner
+        mask[:, :int(w * 0.10)] = 0   # left-border ladder-platform junction
+        mask[:, int(w * 0.90):] = 0   # right-border ladder-platform junction
+        n, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        candidates = []
+        for i in range(1, n):
+            area = stats[i, cv2.CC_STAT_AREA]
+            rh   = stats[i, cv2.CC_STAT_HEIGHT]
+            rw   = stats[i, cv2.CC_STAT_WIDTH]
+            if 3 <= area <= 50 and rh <= 12 and rw <= 12:
+                # Use bounding-box centre — more stable than centroid for irregular blobs
+                cx = int(stats[i, cv2.CC_STAT_LEFT] + rw / 2)
+                cy = int(stats[i, cv2.CC_STAT_TOP]  + rh / 2)
+                candidates.append((area, cx, cy))
+        # Sort to match RAM order: bottom row first, left-to-right within each row.
+        # Row-bucketing groups rivets within ROW_TOL px vertically so left-to-right
+        # ordering within a row isn't disrupted by slight Y variance between rivets
+        # on the same girder. RAM byte 0xC1+i maps directly to _rivet_positions[i].
+        candidates.sort(key=lambda t: -t[2])   # bottommost (highest Y) first
+        ROW_TOL = 15
+        rows = []
+        for cand in candidates[:8]:
+            _, cx, cy = cand
+            placed = False
+            for row in rows:
+                if abs(row[0][2] - cy) <= ROW_TOL:
+                    row.append(cand)
+                    placed = True
+                    break
+            if not placed:
+                rows.append([cand])
+        rows.sort(key=lambda row: -max(t[2] for t in row))   # bottom row first
+        for row in rows:
+            row.sort(key=lambda t: t[1])                       # left-to-right within each row
+        rivets = [(cx, cy) for row in rows for _, cx, cy in row][:8]
+        print(f'[Stage 4] Frame scan found {len(candidates)} candidates → kept {len(rivets)}')
+        return rivets
+
+    def _check_rivet_pops_from_frame(self, obs):
+        """Mark rivet positions where orange pixels have disappeared as popped."""
+        h, w = obs.shape[:2]
+        hsv  = cv2.cvtColor(obs, cv2.COLOR_RGB2HSV)
+        r    = _STAGE4_RIVET_CHECK_R
+        for ri, (rx, ry) in enumerate(self._rivet_positions):
+            if ri in self._rivet_popped:
+                continue
+            y0 = max(0, ry - r);  y1 = min(h, ry + r + 1)
+            x0 = max(0, rx - r);  x1 = min(w, rx + r + 1)
+            orange = cv2.inRange(hsv[y0:y1, x0:x1], STAGE4_RIVET_HSV_LO, STAGE4_RIVET_HSV_HI)
+            if int(orange.sum()) < 255 * 4:   # < 4 orange pixels = rivet is gone
+                self._rivet_popped.add(ri)
 
     def _extract_teal(self, hsv):
         """Binary ladder channel: 1.0 where teal ladder pixels are."""

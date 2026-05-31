@@ -1,6 +1,19 @@
 # Donkey Kong AI
+**Version 1.1**
 
 A reinforcement learning agent that learns to play Donkey Kong (NES) by itself. It uses PPO (a type of AI training algorithm) and a convolutional neural network to watch the game screen and figure out what buttons to press.
+
+---
+
+## Changelog
+
+### v1.1
+- **ROM upgraded to Donkey Kong Original Edition**: includes the cement factory (stage 2) that the standard NES port omitted. All 4 stages are now reachable — Barrels → Cement Factory → Elevators → Rivets.
+- **Multi-stage ladder detection**: each stage now has its own tuned detection method — teal HSV for stage 1, white/low-saturation HSV with two-pass connectivity for stage 2, teal with morphological close to bridge fireball gaps for stage 3, and Sobel rung-counting with colour secondary pass for stage 4. Ladder layout is scanned once on stage entry and cached to disk per stage.
+- **Stage 4 rivet tracking**: Rivet removal now reads directly from RAM bytes `0xC1–0xC8`. Each byte maps 1:1 to a visual position sorted in RAM order (bottom-left → right → up). Proximity-based assignment removed — jumping over a rivet no longer triggers a false collection.
+- **Rivet position detection**: 10% left/right border margin prevents false detections at ladder–platform junctions. Row-bucketing sort ensures visual indices match RAM byte indices.
+- **Stage 4 ladder bounds**: Rung detector now filters out platform-girder rows (< 30% column-concentration). `_clip_stage4_ladders` trims both horizontal and vertical extents near rivet positions (VERT_M = 3 px). Horizontal boxes trimmed ±4 px for tighter fit.
+- **Debug tool (`debug_env.py`)**: Two-column panel layout prevents overflow. New LADDERS section shows all detected ladder rects in NES coordinates. Slot 60 suppressed in all stages; slots 56 and 60 suppressed in stages 3–4.
 
 ---
 
@@ -258,29 +271,29 @@ The ghost viewer opens when you pass `--render` during training. It does not ope
 
 ## Debug tool — interactive RAM inspector
 
-Used to play the game manually and inspect what the AI can see. Useful for verifying that sprite positions, broken ladder zones, and RAM values are being read correctly.
+Used to play the game manually and inspect what the AI can see. Useful for verifying sprite positions, ladder detection, rivet tracking, and RAM values.
 
 ```bash
-python tools/test_broken_ladder.py
+python tools/debug_env.py
 ```
 
-The window has two sections: the game on the left and a live data panel on the right.
+The window has the game on the left and a two-column live data panel on the right (content overflows into the second column automatically).
 
 **Game area (left):**
 - Pink crosshair + green dot — Mario's exact position from OAM sprite data
-- Red crosshairs — active barrels (only visible when DK has thrown them)
-- Orange crosshairs — active fireballs
-- Yellow crosshairs — hammers
-- Red rectangles — broken ladder zones
+- Labelled crosshairs — active barrels, fireballs, hammers, and other sprites
+- Cyan rectangles — detected ladder segments
+- Red rectangles — broken ladder zones (stage 1 only)
+- Yellow squares — intact rivets (stage 4); grey = collected
 
-**Data panel (right):**
+**Data panel (right), two columns:**
 - Game state: score, lives, stage, level, bonus timer
-- Mario X/Y coordinates
-- Broken zone status (turns red when Mario is inside one)
-- Barrel count + exact OAM coordinates of each active barrel
-- Fire count + exact OAM coordinates of each active fire
-- Step count, per-step reward, cumulative reward
-- All detected broken zone rectangles
+- Mario OAM X/Y and broken-zone status
+- All active sprites with OAM coordinates
+- RIVETS (stage 4): detected count, removed count vs RAM, raw `0xC1–0xC8` bytes
+- LADDERS: each detected ladder rect in NES coordinates
+- RAM watch: prints any address that was stable ≥ 2 s then changed
+- Stage jump status and broken zone rectangles
 
 **Controls:**
 
@@ -288,6 +301,11 @@ The window has two sections: the game on the left and a live data panel on the r
 |---|---|
 | **Arrow keys** | Move / climb ladders |
 | **Space** | Jump |
+| **1–4** | Jump to stage (must have been reached once to unlock 2–4) |
+| **P** | Pause / unpause |
+| **D** | Delete and force-rescan ladder cache for current stage |
+| **N** | Toggle raw OAM slot-number overlay |
+| **W** | Toggle RAM watch mode (prints stable→changed addresses to console) |
 | **Q / Escape** | Quit (prints bonus timer analysis on exit) |
 
 When you quit, the tool analyses the full RAM recording and reports which address is the bonus/time-remaining counter — useful for identifying new RAM locations.
@@ -342,7 +360,16 @@ Mario's position, barrel proximity, and fire proximity are all read directly fro
 
 This replaces all HSV colour scanning for hazard detection — OAM reads are instant, pixel-perfect, and never produce false positives from background tiles or overlapping sprites.
 
-**Ladder detection** still uses HSV colour detection (teal pixels), but only once per episode at reset time. Ladders are static within a stage so there is no need to re-scan every step.
+**Ladder detection** is performed once on stage entry (cached to disk) and uses a different method per stage:
+
+| Stage | Name | Detection method |
+|---|---|---|
+| 1 | Barrels | Teal HSV connected components |
+| 2 | Cement Factory | White/low-saturation HSV, two-pass connectivity to merge rails and bridge rung gaps |
+| 3 | Elevators | Teal HSV with morphological close (kernel 17 px) to bridge fireball gaps |
+| 4 | Rivets | Sobel horizontal-edge rung-counting (primary) + yellow/amber HSV for short stubs (secondary); rects clipped around rivet positions |
+
+Ladders are static within a stage so detection only runs when the stage changes, not every step.
 
 **Platform checkpoints (opt-in):** The first time Mario safely reaches each platform, the emulator state is saved. Future episodes sample across all saved platforms — weighted toward higher ones — so the agent gets concentrated practice at every transition rather than always climbing from scratch.
 
@@ -367,7 +394,8 @@ evaluation/
   metrics.py           # Tracks reward, steps, deaths per episode
   plot_results.py      # Generates reward/height graphs after training
 tools/
-  test_broken_ladder.py  # Interactive debug tool — play manually, inspect OAM data live
+  debug_env.py         # Interactive debug tool — play manually, inspect sprites/ladders/rivets/RAM live
+  test_broken_ladder.py  # Legacy broken-ladder zone tester
   debug_detection.py     # Colour detection inspector (for ladder HSV tuning)
 retro_data/            # NES game integration files (ROM not included)
 saved_models/          # Where checkpoints are saved during training
@@ -388,13 +416,13 @@ saved_models/          # Where checkpoints are saved during training
 
 ## Notes
 
-- The ROM is not in this repo — you must provide your own copy named `Donkey Kong.nes`
+- The ROM is not in this repo — you need **Donkey Kong Original Edition** (`DonkeyKongOriginalEdition.nes`), not the standard NES port. The Original Edition includes the cement factory stage (stage 2) that the standard port omitted
 - Saved models are not committed to git — share `.zip` files manually
 - At least 10 million timesteps recommended before the agent starts climbing consistently
 - GPU training (NVIDIA only) is 10–20× faster than CPU — change `device='cpu'` to `device='cuda'` in `training/train_ppo.py`
 - Saved models trained before OAM-based detection was added (pre-7-channel) are incompatible — the script will detect this and tell you rather than crashing
 - To expand to 8 observation channels (adding a hammer channel): set `OBS_CHANNELS = 8` in `donkey_kong_env.py` and uncomment the hammer line in `_get_state()` — requires retraining from scratch
 - The level counter (NES RAM address 84) is 0-indexed internally — add 1 before displaying so L1 matches what the game shows
-- The stage register (NES RAM address 83) cycles 1 → 3 → 4 → 1, not 1 → 2 → 3 — slot 2 is reserved and skipped by the ROM
+- The stage register (NES RAM address 83) cycles 1 → 2 → 3 → 4 → 1 in Donkey Kong Original Edition (all four stages present)
 - Each time you continue training from a checkpoint, TensorBoard creates a new run line — the previous run's graph is preserved separately
 - If `height/mean` in TensorBoard is flat after 300k steps, check `environment/donkey_kong_env.py` — the reward signal may need tuning

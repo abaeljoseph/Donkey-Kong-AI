@@ -1,0 +1,14 @@
+{
+  "info": {
+    "lives":       { "address": 85,  "type": "|u1" },
+    "gameover":    { "address": 78,  "type": "|u1" },
+    "score":       { "address": 36,  "type": ">d4" },
+    "mario_x":     { "address": 67,  "type": "|u1" },
+    "mario_y":     { "address": 46,  "type": "|u1" },
+    "stage":       { "address": 83,  "type": "|u1" },
+    "level":       { "address": 84,  "type": "|u1" },
+    "bonus":       { "address": 46,  "type": ">d2" },
+    "mario_y_oam": { "address": 512, "type": "|u1" },
+    "mario_x_oam": { "address": 515, "type": "|u1" }
+  }
+}

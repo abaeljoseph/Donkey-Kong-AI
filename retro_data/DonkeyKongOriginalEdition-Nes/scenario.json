@@ -1,0 +1,8 @@
+{
+  "done": {
+    "variables": {
+      "gameover": { "op": "equal", "reference": 1 }
+    }
+  },
+  "reward": {}
+}

@@ -42,7 +42,8 @@ from evaluation.metrics import MetricsTracker
 CUSTOM_INTEGRATION_PATH = os.path.join(os.path.dirname(__file__), '..', 'retro_data')
 
 
-def _make_env_fn(render=False, rank=0, ghost_viewer=False, use_checkpoints=False, force_highest=False):
+def _make_env_fn(render=False, rank=0, ghost_viewer=False, use_checkpoints=False, force_highest=False,
+                 game_name=None, game_state=None):
     path = os.path.abspath(CUSTOM_INTEGRATION_PATH)
     def _fn():
         env = DonkeyKongGymEnv(
@@ -52,6 +53,8 @@ def _make_env_fn(render=False, rank=0, ghost_viewer=False, use_checkpoints=False
             provide_detect=ghost_viewer,
             use_checkpoints=use_checkpoints,
             force_highest=force_highest,
+            game_name=game_name,
+            game_state=game_state,
         )
         return Monitor(env)
     return _fn
@@ -148,6 +151,8 @@ def train_ppo(
     ghost_viewer: bool    = True,
     use_checkpoints: bool = False,
     force_highest: bool   = False,
+    game_name: str        = None,
+    game_state: str       = None,
 ) -> MetricsTracker:
 
     os.makedirs(save_dir, exist_ok=True)
@@ -155,7 +160,7 @@ def train_ppo(
     torch.backends.cudnn.benchmark = True
 
     integration_path = os.path.abspath(CUSTOM_INTEGRATION_PATH)
-    all_ladders  = auto_detect_all_ladders(integration_path)
+    all_ladders  = auto_detect_all_ladders(integration_path, game_name=game_name, game_state=game_state)
 
     # Clear stale suspension flag from any previous run so envs don't start
     # suspended and fall back to ground floor on the very first episode.
@@ -166,7 +171,8 @@ def train_ppo(
         print('[Checkpoint] Cleared stale suspension flag from previous run')
 
     env_fns = [_make_env_fn(render=render, rank=i, ghost_viewer=ghost_viewer,
-                            use_checkpoints=use_checkpoints, force_highest=force_highest)
+                            use_checkpoints=use_checkpoints, force_highest=force_highest,
+                            game_name=game_name, game_state=game_state)
                for i in range(num_envs)]
     raw_env = SubprocVecEnv(env_fns)
 
