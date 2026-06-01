@@ -10,6 +10,7 @@ Run via main.py:
 """
 
 import os
+import time
 import torch
 
 # PyTorch 2.6 changed torch.load default to weights_only=True, which blocks
@@ -33,7 +34,7 @@ from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
 from stable_baselines3.common.monitor import Monitor
 
 from environment.gym_wrapper import DonkeyKongGymEnv
-from environment.donkey_kong_env import MARIO_Y_START, auto_detect_all_ladders
+from environment.donkey_kong_env import MARIO_Y_START, FRAME_SKIP, auto_detect_all_ladders
 from environment.ghost_viewer import GhostViewerCallback
 from environment.pybullet_arm import RobotArm
 from evaluation.metrics import MetricsTracker
@@ -42,7 +43,8 @@ from evaluation.metrics import MetricsTracker
 CUSTOM_INTEGRATION_PATH = os.path.join(os.path.dirname(__file__), '..', 'retro_data')
 
 
-def _make_env_fn(render=False, rank=0, ghost_viewer=False, use_checkpoints=False, force_highest=False):
+def _make_env_fn(render=False, rank=0, ghost_viewer=False, use_checkpoints=False, force_highest=False,
+                 frame_send_every=None):
     path = os.path.abspath(CUSTOM_INTEGRATION_PATH)
     def _fn():
         env = DonkeyKongGymEnv(
@@ -52,9 +54,35 @@ def _make_env_fn(render=False, rank=0, ghost_viewer=False, use_checkpoints=False
             provide_detect=ghost_viewer,
             use_checkpoints=use_checkpoints,
             force_highest=force_highest,
+            frame_send_every=(frame_send_every if rank == 0 else None),
         )
         return Monitor(env)
     return _fn
+
+
+# Target cadence for the robot animation between game decisions (~22 fps).
+_ARM_SUBFRAME_DT = 0.045
+
+
+def _render_arm_until(arm, deadline):
+    """Animate the robot with as many render sub-frames as fit before `deadline`.
+
+    The game produces one decision every FRAME_SKIP/60 s; rendering the arm
+    several times within that window (instead of once) makes the robot move
+    smoothly and stay locked to real time. Always renders at least once.
+    """
+    remaining = deadline - time.perf_counter()
+    if remaining <= 0.0:
+        arm.tick(force_draw=True)
+        return
+    n = max(1, int(round(remaining / _ARM_SUBFRAME_DT)))
+    dt = remaining / n
+    for _ in range(n):
+        t0 = time.perf_counter()
+        arm.tick(force_draw=True)
+        rem = dt - (time.perf_counter() - t0)
+        if rem > 0.0:
+            time.sleep(rem)
 
 
 class ArmMirrorCallback(BaseCallback):
@@ -150,6 +178,7 @@ def train_ppo(
     ghost_viewer: bool    = True,
     use_checkpoints: bool = False,
     force_highest: bool   = False,
+    play_speed: float     = 1.0,
 ) -> MetricsTracker:
 
     os.makedirs(save_dir, exist_ok=True)
@@ -167,8 +196,12 @@ def train_ppo(
         os.remove(stale_flag)
         print('[Checkpoint] Cleared stale suspension flag from previous run')
 
+    # When the arm cabinet is shown during eval, refresh env-0's display frame
+    # every decision so the on-screen game stays in step with the arm motion.
+    eval_frame_every = 1 if (eval_only and use_arm) else None
     env_fns = [_make_env_fn(render=render, rank=i, ghost_viewer=ghost_viewer,
-                            use_checkpoints=use_checkpoints, force_highest=force_highest)
+                            use_checkpoints=use_checkpoints, force_highest=force_highest,
+                            frame_send_every=eval_frame_every)
                for i in range(num_envs)]
     raw_env = SubprocVecEnv(env_fns)
 
@@ -276,14 +309,34 @@ def train_ppo(
         ep_count, ep_reward, ep_best_y = 0, 0.0, 999
         ep_deaths, ep_prev_lives, ep_won = 0, None, False
         best_ever_y, best_ever_ep = 999, 0
+
+        # Opening coin-insert: run it here (after the model + env are loaded)
+        # rather than during arm construction, which froze the first frame.
+        if arm is not None and hasattr(arm, 'run_coin_insert'):
+            arm.run_coin_insert(game_over=False)
+
+        # Real-time pacing: one decision = FRAME_SKIP NES frames @ 60 Hz.
+        # Pacing the loop to this period makes the game and the arm tick together
+        # at true arcade speed instead of running flat-out. play_speed scales it.
+        target_period = (FRAME_SKIP / 60.0) / max(play_speed, 1e-3) if play_speed > 0 else 0.0
+        # When the sim arm is shown at real time, render it over many sub-frames
+        # per decision so it animates smoothly instead of once per decision.
+        arm_realtime = (arm is not None and target_period > 0.0
+                        and hasattr(arm, 'begin_action'))
+        deadline = time.perf_counter()
         while True:
+            if target_period > 0.0:
+                deadline += target_period
             action, _ = model.predict(obs, deterministic=False)
             obs, rewards, dones, infos = vec_env.step(action)
             if arm is not None:
                 raw_frame = infos[0].get('_raw_frame')
                 if raw_frame is not None and hasattr(arm, 'set_game_frame'):
                     arm.set_game_frame(raw_frame)
-                arm.step(int(action[0]))
+                if arm_realtime:
+                    arm.begin_action(int(action[0]))   # set targets; render below
+                else:
+                    arm.step(int(action[0]))
             ep_reward += float(rewards[0])
             mario_y = infos[0].get('mario_y', 999)
             lives   = infos[0].get('lives')
@@ -303,8 +356,25 @@ def train_ppo(
                 print(f'  {ep_count:4d}  {ep_reward:8.1f}  {plat:>20}  {note}')
                 metrics.log_episode(reward=ep_reward, steps=0, deaths=ep_deaths,
                                     won=ep_won, loss=0.0, eps=0.0)
+                # Arcade coin-start loop: when the game truly ends (all lives lost
+                # or a win), the robot physically re-inserts a coin to start again.
+                round_over = bool(infos[0].get('gameover')) or ep_won
+                if arm is not None and round_over and hasattr(arm, 'run_coin_insert'):
+                    arm.run_coin_insert(game_over=True)
+                    deadline = time.perf_counter()   # resync clock after the animation
                 ep_reward, ep_best_y = 0.0, 999
                 ep_deaths, ep_prev_lives, ep_won = 0, None, False
+
+            # Pace to real time. With the sim arm we fill the budget by rendering
+            # the robot across several sub-frames; otherwise just sleep.
+            if arm_realtime:
+                _render_arm_until(arm, deadline)
+            elif target_period > 0.0:
+                sleep_for = deadline - time.perf_counter()
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+                else:
+                    deadline = time.perf_counter()   # fell behind — resync
 
     else:
         model.learn(

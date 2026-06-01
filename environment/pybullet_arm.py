@@ -38,6 +38,27 @@ _JOYSTICK_TILT = 0.30
 # Half-length of the joystick shaft (metres)
 _SHAFT_HALF = 0.065
 
+# Low-pass factor for the joystick deflection, applied per decision step.
+# The eval policy samples stochastically, so raw actions flicker between
+# directions; filtering makes the stick follow the dominant direction and
+# stops single-frame flickers from snapping it to a full tilt. Lower = smoother
+# (more lag), higher = snappier (more jitter). 0..1.
+_JOYSTICK_SMOOTH = 0.30
+# Tiny residual deflection below this magnitude snaps to centre.
+_JOYSTICK_DEADZONE = 0.06
+
+# Action -> target (dx, dy) joystick deflection in [-1, 1].
+_ACTION_DEFLECT = {
+    0: ( 0.0,  0.0),  # NOOP
+    1: (-1.0,  0.0),  # LEFT
+    2: ( 1.0,  0.0),  # RIGHT
+    3: ( 0.0,  1.0),  # UP
+    4: ( 0.0, -1.0),  # DOWN
+    5: ( 0.0,  0.0),  # JUMP
+    6: (-1.0,  0.0),  # JUMP + LEFT
+    7: ( 1.0,  0.0),  # JUMP + RIGHT
+}
+
 # Arm base positions (floor-mounted, side by side)
 JOYSTICK_ARM_BASE = (-0.50, 0.0, 0.0)
 BUTTON_ARM_BASE   = ( 0.50, 0.0, 0.0)
@@ -70,14 +91,40 @@ _JOINT_FORCE   = 300
 _JUMP_ACTIONS = frozenset({5, 6, 7})
 _SOFTWARE_VIEW_W = 640
 _SOFTWARE_VIEW_H = 426
-_SOFTWARE_VIEW_FPS = 10.0
+_SOFTWARE_VIEW_FPS = 24.0
+# Cap the internal (CPU-rendered) camera image, then upscale to the window.
+# TINY_RENDERER cost scales with pixel count: 640x426≈90ms, 512x340≈58ms,
+# 384x255≈33ms. 512 keeps good quality while still fitting the ~66ms budget
+# at 2.0x playback (the speed this looks best at).
+_SOFTWARE_MAX_RENDER_DIM = 512
 
-COIN_PICKUP_POS = (0.28, 0.31, 0.42)
-COIN_SLOT_POS = (0.08, 0.462, 0.255)
-COIN_SLOT_APPROACH = (0.08, 0.35, 0.32)
-COIN_SLOT_INSERT = (0.08, 0.445, 0.285)
-COIN_HALF_INSERTED = (0.08, 0.438, 0.261)
+# The control deck box spans Y 0.22–0.58.  The arm must stay OUTSIDE (Y < 0.22)
+# or ABOVE (Z > 0.32) the deck at all times.  Path: pickup (above deck) →
+# swing out in front (Y < 0.22, high Z) → lower to slot height still in front →
+# push coin inward (+Y) into the front-face slot.
+COIN_PICKUP_POS    = (0.28, 0.31, 0.42)    # tray, above the deck (Z > 0.32) ✓
+COIN_SLOT_POS      = (0.0, 0.205, 0.30)    # coin door on the front face
+COIN_SLOT_APPROACH = (0.0, 0.12, 0.42)     # out in front of the cabinet, high up ✓
+COIN_SLOT_INSERT   = (0.0, 0.12, 0.30)     # lower to slot height, still in front ✓
+COIN_HALF_INSERTED = (0.0, 0.19, 0.30)
 _COIN_ORI = p.getQuaternionFromEuler([math.pi / 2.0, 0.0, 0.0])
+
+# ---------------------------------------------------------------------------
+# Simple two-finger gripper (visual, glued to each arm's end-effector)
+# ---------------------------------------------------------------------------
+
+# Half-distance from the EEF centre to each finger. set_gripper(0)=closed, (1)=open.
+GRIP_CLOSED_GAP = 0.024   # straddles the ~0.040 coin / joystick knob
+GRIP_OPEN_GAP   = 0.046
+GRIP_RATE       = 0.0045  # metres per update — gives a smooth open/close
+_PALM_HALF      = [0.032, 0.024, 0.010]
+_BRIDGE_HALF    = [GRIP_OPEN_GAP, 0.020, 0.010]  # body bar the fingers slide along
+_FINGER_HALF    = [0.007, 0.013, 0.026]
+_PALM_DZ        = -0.014  # palm sits just below the flange
+_BRIDGE_DZ      = -0.028  # body/spacer between palm and the two fingers
+_FINGER_DZ      = -0.044  # fingers hang below the body
+_GRIP_TIP_DZ    = -0.066  # where a held object sits between the fingertips
+_GRIP_ORI       = (0.0, 0.0, 0.0, 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +172,7 @@ def _build_arcade_console(client: int):
     # Upright cabinet shell behind the controls.
     _static_box(client, [0.46, 0.16, 0.76], [0.0, 0.68, 0.76], dark_blue)
     _static_box(client, [0.50, 0.035, 0.08], [0.0, 0.50, 1.34], red)
-    _static_box(client, [0.42, 0.012, 0.19], [0.0, 0.49, 0.95], black)
+    _static_box(client, [0.42, 0.012, 0.27], [0.0, 0.49, 0.95], black)
 
     # Simple Donkey Kong-style screen art: blue girders and a yellow player marker.
     _static_box(client, [0.34, 0.006, 0.010], [0.0, 0.478, 0.88], blue)
@@ -156,12 +203,16 @@ def _build_arcade_console(client: int):
     # Lower cabinet details.
     _static_box(client, [0.30, 0.012, 0.10], [0.0, 0.485, 0.22], black)
     _static_box(client, [0.045, 0.008, 0.020], [-0.06, 0.47, 0.25], grey)
-    _static_box(client, [0.074, 0.008, 0.038], [COIN_SLOT_POS[0], 0.468, COIN_SLOT_POS[2]], yellow)
-    _static_box(client, [0.058, 0.006, 0.028], [COIN_SLOT_POS[0], 0.462, COIN_SLOT_POS[2]], grey)
-    _static_box(client, [0.040, 0.005, 0.005], [COIN_SLOT_POS[0], 0.456, COIN_SLOT_POS[2] + 0.006], black)
-    _static_box(client, [0.060, 0.006, 0.006], [COIN_SLOT_POS[0], 0.459, COIN_SLOT_POS[2] + 0.044], red)
-    _static_box(client, [0.012, 0.006, 0.028], [COIN_SLOT_POS[0] - 0.052, 0.458, COIN_SLOT_POS[2]], teal)
-    _static_box(client, [0.012, 0.006, 0.028], [COIN_SLOT_POS[0] + 0.052, 0.458, COIN_SLOT_POS[2]], teal)
+    # Coin door on the FRONT face of the cabinet, facing the camera (−Y side).
+    # Layered front-to-back: the black slot is frontmost so the coin visibly
+    # goes into the front of the arcade.
+    cdx, cdz = COIN_SLOT_POS[0], COIN_SLOT_POS[2]
+    _static_box(client, [0.058, 0.024, 0.052], [cdx, 0.236, cdz], yellow)         # door body (set into front)
+    _static_box(client, [0.042, 0.008, 0.040], [cdx, 0.205, cdz], grey)           # bezel
+    _static_box(client, [0.006, 0.007, 0.024], [cdx, 0.190, cdz + 0.004], black)  # vertical coin slot
+    _static_box(client, [0.048, 0.007, 0.006], [cdx, 0.192, cdz + 0.042], red)    # label strip
+    _static_box(client, [0.010, 0.007, 0.030], [cdx - 0.050, 0.197, cdz], teal)   # side accents
+    _static_box(client, [0.010, 0.007, 0.030], [cdx + 0.050, 0.197, cdz], teal)
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +244,63 @@ class KukaArm:
                                     targetPosition=angle, force=_JOINT_FORCE,
                                     physicsClientId=client)
         self._last_target = None
+
+        # Two-finger gripper, visually attached to the end-effector flange.
+        self._grip        = GRIP_CLOSED_GAP   # current half-gap (animated)
+        self._grip_target = GRIP_CLOSED_GAP
+        self._eef_world   = base_pos
+        self._build_gripper()
+        self.update_gripper()
+
+    def _build_gripper(self):
+        c = self.client
+        body_col   = [0.16, 0.16, 0.18, 1.0]   # palm + spacer body (dark)
+        finger_col = [0.62, 0.64, 0.68, 1.0]   # sliding fingers (metallic grey)
+
+        def _visual_box(half, colour):
+            return p.createMultiBody(
+                baseMass=0,
+                baseCollisionShapeIndex=-1,
+                baseVisualShapeIndex=p.createVisualShape(
+                    p.GEOM_BOX, halfExtents=half, rgbaColor=colour,
+                    physicsClientId=c),
+                basePosition=[0.0, 0.0, -1.0],
+                physicsClientId=c,
+            )
+
+        self._palm     = _visual_box(_PALM_HALF, body_col)
+        self._bridge   = _visual_box(_BRIDGE_HALF, body_col)   # boxed spacer between grips
+        self._finger_l = _visual_box(_FINGER_HALF, finger_col)
+        self._finger_r = _visual_box(_FINGER_HALF, finger_col)
+
+    def set_gripper(self, opening: float):
+        """opening: 0.0 = fully closed (grasping), 1.0 = fully open."""
+        opening = max(0.0, min(1.0, opening))
+        self._grip_target = GRIP_CLOSED_GAP + opening * (GRIP_OPEN_GAP - GRIP_CLOSED_GAP)
+
+    def gripper_tip(self):
+        """World point sitting between the fingertips (for placing a held coin)."""
+        ex, ey, ez = self._eef_world
+        return (ex, ey, ez + _GRIP_TIP_DZ)
+
+    def update_gripper(self):
+        """Animate the gripper toward its target and glue it to the live EEF pose."""
+        delta = self._grip_target - self._grip
+        self._grip += max(-GRIP_RATE, min(GRIP_RATE, delta))
+
+        state = p.getLinkState(self.arm, _KUKA_EEF_LINK, physicsClientId=self.client)
+        ex, ey, ez = state[4]
+        self._eef_world = (ex, ey, ez)
+        p.resetBasePositionAndOrientation(
+            self._palm, (ex, ey, ez + _PALM_DZ), _GRIP_ORI, physicsClientId=self.client)
+        p.resetBasePositionAndOrientation(
+            self._bridge, (ex, ey, ez + _BRIDGE_DZ), _GRIP_ORI, physicsClientId=self.client)
+        p.resetBasePositionAndOrientation(
+            self._finger_l, (ex - self._grip, ey, ez + _FINGER_DZ), _GRIP_ORI,
+            physicsClientId=self.client)
+        p.resetBasePositionAndOrientation(
+            self._finger_r, (ex + self._grip, ey, ez + _FINGER_DZ), _GRIP_ORI,
+            physicsClientId=self.client)
 
     def move_to(self, target_pos: tuple, target_ori: tuple = None):
         """IK-drive the EEF to target_pos. Only re-solves when target changes."""
@@ -236,69 +344,55 @@ class JoystickKukaArm(KukaArm):
             base_pos=JOYSTICK_ARM_BASE,
             colour=[0.20, 0.48, 0.90, 1.0],
         )
-        cx, cy, cz = JOYSTICK_CENTER
-        d = JOYSTICK_DEFLECT
-        self._targets = {
-            0: (cx,     cy,     cz),
-            1: (cx - d, cy,     cz),
-            2: (cx + d, cy,     cz),
-            3: (cx,     cy + d, cz),
-            4: (cx,     cy - d, cz),
-            5: (cx,     cy,     cz),
-            6: (cx - d, cy,     cz),
-            7: (cx + d, cy,     cz),
-        }
+        # Smoothed deflection state (dx, dy) in [-1, 1]; filtered each step.
+        self._defl = [0.0, 0.0]
         self._build_joystick()
         self.move_to(JOYSTICK_CENTER)
+        self._tilt_joystick(0.0, 0.0)
 
     def step(self, action_idx: int):
-        self.move_to(self._targets.get(action_idx, JOYSTICK_CENTER))
-        self._tilt_joystick(action_idx)
+        tx, ty = _ACTION_DEFLECT.get(action_idx, (0.0, 0.0))
+        a = _JOYSTICK_SMOOTH
+        self._defl[0] += a * (tx - self._defl[0])
+        self._defl[1] += a * (ty - self._defl[1])
+        # Settle to dead-centre when the residual deflection is negligible.
+        if abs(self._defl[0]) < _JOYSTICK_DEADZONE and tx == 0.0:
+            self._defl[0] = 0.0
+        if abs(self._defl[1]) < _JOYSTICK_DEADZONE and ty == 0.0:
+            self._defl[1] = 0.0
+
+        dx, dy = self._defl
+        cx, cy, cz = JOYSTICK_CENTER
+        self.move_to((cx + dx * JOYSTICK_DEFLECT,
+                      cy + dy * JOYSTICK_DEFLECT,
+                      cz))
+        self._tilt_joystick(dx, dy)
 
     # ------------------------------------------------------------------
     # Joystick tilt helpers
 
-    def _tilt_joystick(self, action_idx: int):
-        """Physically tilt the shaft and knob to match the action direction."""
+    def _tilt_joystick(self, dx: float, dy: float):
+        """Tilt the shaft/knob continuously toward the (dx, dy) deflection."""
         cx, cy, cz = JOYSTICK_CENTER
-        # Pivot = top of base plate
-        pivot = (cx, cy, cz - 0.158)
-        shaft_pos, shaft_ori, knob_pos = self._shaft_transform(action_idx, pivot)
-        p.resetBasePositionAndOrientation(
-            self._shaft, shaft_pos, shaft_ori, physicsClientId=self.client)
-        p.resetBasePositionAndOrientation(
-            self._knob, knob_pos, (0, 0, 0, 1), physicsClientId=self.client)
-
-    @staticmethod
-    def _shaft_transform(action_idx, pivot):
-        """Return (shaft_centre, shaft_ori_quat, knob_pos) for a given action."""
-        px, py, pz = pivot
+        px, py, pz = (cx, cy, cz - 0.158)   # pivot = top of base plate
         L = _SHAFT_HALF
-        T = _JOYSTICK_TILT
-        s, c = math.sin(T), math.cos(T)
+        ex = -_JOYSTICK_TILT * dy           # tilt about X for forward/back
+        ey =  _JOYSTICK_TILT * dx           # tilt about Y for left/right
 
-        if action_idx in (1, 6):          # LEFT  — tilt toward -X
-            shaft = (px - s*L, py,      pz + c*L)
-            ori   = p.getQuaternionFromEuler([0, -T, 0])
-            knob  = (px - s*2*L, py,    pz + c*2*L)
-        elif action_idx in (2, 7):        # RIGHT — tilt toward +X
-            shaft = (px + s*L, py,      pz + c*L)
-            ori   = p.getQuaternionFromEuler([0,  T, 0])
-            knob  = (px + s*2*L, py,    pz + c*2*L)
-        elif action_idx == 3:             # UP    — tilt toward +Y
-            shaft = (px, py + s*L,      pz + c*L)
-            ori   = p.getQuaternionFromEuler([-T, 0, 0])
-            knob  = (px, py + s*2*L,    pz + c*2*L)
-        elif action_idx == 4:             # DOWN  — tilt toward -Y
-            shaft = (px, py - s*L,      pz + c*L)
-            ori   = p.getQuaternionFromEuler([ T, 0, 0])
-            knob  = (px, py - s*2*L,    pz + c*2*L)
-        else:                             # NOOP / JUMP — centred
-            shaft = (px,       py,      pz + L)
-            ori   = (0, 0, 0, 1)
-            knob  = (px,       py,      pz + 2*L)
+        # Unit direction of the shaft after the [ex, ey, 0] rotation.
+        dvec = (
+            math.sin(ey),
+            -math.cos(ey) * math.sin(ex),
+            math.cos(ey) * math.cos(ex),
+        )
+        shaft = (px + dvec[0] * L,     py + dvec[1] * L,     pz + dvec[2] * L)
+        knob  = (px + dvec[0] * 2 * L, py + dvec[1] * 2 * L, pz + dvec[2] * 2 * L)
+        ori   = p.getQuaternionFromEuler([ex, ey, 0.0])
 
-        return shaft, ori, knob
+        p.resetBasePositionAndOrientation(
+            self._shaft, shaft, ori, physicsClientId=self.client)
+        p.resetBasePositionAndOrientation(
+            self._knob, knob, (0, 0, 0, 1), physicsClientId=self.client)
 
     def _build_joystick(self):
         c  = self.client
@@ -421,7 +515,7 @@ class RobotArm:
         self._clock = None
         self._view_w = _SOFTWARE_VIEW_W if software_viewer else 960
         self._view_h = _SOFTWARE_VIEW_H if software_viewer else 640
-        self._max_render_dim = 960
+        self._max_render_dim = _SOFTWARE_MAX_RENDER_DIM if software_viewer else 960
         self._render_interval = 1.0 / _SOFTWARE_VIEW_FPS
         self._last_render_time = 0.0
         self._sim_steps = 3 if software_viewer else 12
@@ -447,6 +541,7 @@ class RobotArm:
         self.joystick_arm = JoystickKukaArm(self.client)
         self.button_arm   = ButtonKukaArm(self.client)
         self._coin_body = self._build_coin()
+        self._disable_arm_collisions()
 
         if gui and not software_viewer:
             # Camera looking straight at both arms from the front
@@ -459,8 +554,23 @@ class RobotArm:
             )
         elif software_viewer:
             self._init_software_viewer()
-        if gui:
-            self._run_startup_sequence()
+        # NOTE: the opening coin-insert is NOT run here. Animating during
+        # construction (before the model/env finish loading) froze the very
+        # first frame. The eval loop calls run_coin_insert() once everything
+        # is ready, so the first game and post-GAME-OVER restarts behave the
+        # same way. The cabinet simply starts on the 'INSERT COIN' screen.
+
+    def _disable_arm_collisions(self):
+        """Both arms are driven kinematically (position control), so remove them
+        from collision entirely. This guarantees the robots never collide with
+        each other or the arcade cabinet — no interpenetration jitter or fighting
+        against the static console geometry."""
+        for body in (self.joystick_arm.arm, self.button_arm.arm):
+            njoints = p.getNumJoints(body, physicsClientId=self.client)
+            for link in range(-1, njoints):
+                p.setCollisionFilterGroupMask(
+                    body, link, collisionFilterGroup=0, collisionFilterMask=0,
+                    physicsClientId=self.client)
 
     def _build_coin(self):
         return p.createMultiBody(
@@ -489,6 +599,9 @@ class RobotArm:
         return tuple(a[i] + (b[i] - a[i]) * t for i in range(3))
 
     def _move_startup_segment(self, start, end, frames, coin_mode='hidden'):
+        # The button arm's gripper closes only while it is carrying the coin
+        # ('hand'); it stays open while reaching for or releasing it.
+        grip_open = 0.0 if coin_mode == 'hand' else 1.0
         for frame in range(max(frames, 1)):
             if self._closed:
                 return
@@ -496,24 +609,76 @@ class RobotArm:
             pos = self._lerp(start, end, t)
             self.joystick_arm.step(0)
             self.button_arm.move_to(pos)
+            self.button_arm.set_gripper(grip_open)
+
+            for _ in range(self._sim_steps):
+                p.stepSimulation(physicsClientId=self.client)
+            self.joystick_arm.update_gripper()
+            self.button_arm.update_gripper()
 
             if coin_mode == 'table':
                 self._set_coin_position(COIN_PICKUP_POS)
             elif coin_mode == 'hand':
-                self._set_coin_position((pos[0], pos[1] + 0.025, pos[2] - 0.025))
+                # Glue the coin to the actual fingertip gap so it reads as held.
+                self._set_coin_position(self.button_arm.gripper_tip())
             elif coin_mode == 'slot':
                 self._set_coin_position((COIN_SLOT_POS[0], COIN_SLOT_POS[1] - 0.004, COIN_SLOT_POS[2]))
             else:
                 self._set_coin_position(COIN_PICKUP_POS, visible=False)
 
-            for _ in range(self._sim_steps):
-                p.stepSimulation(physicsClientId=self.client)
             self._draw_software_viewer(force=True)
             if not self._software_viewer:
                 time.sleep(1.0 / 60.0)
 
-    def _run_startup_sequence(self):
-        print('[RobotArm] Startup sequence: inserting coin')
+    def _hold_screen(self, state, frames=40):
+        """Hold a screen state (e.g. GAME OVER) with both arms parked at rest."""
+        self._screen_state = state
+        for _ in range(max(frames, 1)):
+            if self._closed:
+                return
+            self.joystick_arm.step(0)
+            self.button_arm.step(0)
+            for _ in range(self._sim_steps):
+                p.stepSimulation(physicsClientId=self.client)
+            self.joystick_arm.update_gripper()
+            self.button_arm.update_gripper()
+            self._draw_software_viewer(force=True)
+            if not self._software_viewer:
+                time.sleep(1.0 / 60.0)
+
+    def _drop_coin_into_slot(self, frames=10):
+        """From outside the cabinet, push the coin INWARD (+Y) into the slot on
+        the front face, then it disappears inside."""
+        start = (COIN_SLOT_POS[0], COIN_SLOT_INSERT[1], COIN_SLOT_INSERT[2])
+        end   = (COIN_SLOT_POS[0], COIN_SLOT_POS[1] + 0.04, COIN_SLOT_POS[2])
+        for f in range(max(frames, 1)):
+            if self._closed:
+                return
+            t = (f + 1) / float(max(frames, 1))
+            self.button_arm.set_gripper(1.0)   # open to release the coin
+            self._set_coin_position(self._lerp(start, end, t))
+            for _ in range(self._sim_steps):
+                p.stepSimulation(physicsClientId=self.client)
+            self.joystick_arm.update_gripper()
+            self.button_arm.update_gripper()
+            self._draw_software_viewer(force=True)
+            if not self._software_viewer:
+                time.sleep(1.0 / 60.0)
+        self._set_coin_position(COIN_PICKUP_POS, visible=False)
+
+    def run_coin_insert(self, game_over=False):
+        """
+        Play the coin-insertion animation, then leave the screen on LOADING GAME
+        so the next step() flips it to GAME RUNNING.  Replayable: call it again
+        after a game-over to physically start a fresh game.
+        """
+        if self._closed:
+            return
+        if game_over:
+            print('[RobotArm] Game over — re-inserting coin')
+            self._hold_screen('GAME OVER', frames=48)
+        else:
+            print('[RobotArm] Startup sequence: inserting coin')
         self._screen_state = 'INSERT COIN'
         self._set_coin_position(COIN_PICKUP_POS)
         self._draw_software_viewer(force=True)
@@ -521,9 +686,9 @@ class RobotArm:
         self._move_startup_segment(COIN_PICKUP_POS, COIN_SLOT_APPROACH, 14, coin_mode='hand')
         self._move_startup_segment(COIN_SLOT_APPROACH, COIN_SLOT_INSERT, 8, coin_mode='hand')
         self._screen_state = 'LOADING GAME'
-        self._move_startup_segment(COIN_SLOT_INSERT, COIN_SLOT_APPROACH, 6, coin_mode='slot')
+        self._drop_coin_into_slot()   # coin falls into the slot and disappears
+        self._move_startup_segment(COIN_SLOT_INSERT, COIN_SLOT_APPROACH, 6, coin_mode='hidden')
         self._move_startup_segment(COIN_SLOT_APPROACH, BUTTON_REST, 12, coin_mode='hidden')
-        self._set_coin_position(COIN_HALF_INSERTED)
 
     def _init_software_viewer(self):
         import pygame
@@ -619,12 +784,16 @@ class RobotArm:
         )
 
     def _draw_cabinet_screen_overlay(self, view, proj, render_w, render_h):
+        # Screen quad sized to the real Donkey Kong arcade ratio (256x224 ≈ 8:7),
+        # so the game frame is shown without horizontal stretching.
         y = 0.468
+        z_top, z_bot = 1.20, 0.70          # height 0.50 (enlarged), centred at 0.95
+        half_w = 0.5 * (z_top - z_bot) * (256.0 / 224.0)   # = 0.286
         corners = [
-            (-0.38, y, 1.12),
-            (0.38, y, 1.12),
-            (0.38, y, 0.78),
-            (-0.38, y, 0.78),
+            (-half_w, y, z_top),
+            (half_w, y, z_top),
+            (half_w, y, z_bot),
+            (-half_w, y, z_bot),
         ]
         points = [
             self._project_world_to_viewer(c, view, proj, render_w, render_h)
@@ -669,6 +838,13 @@ class RobotArm:
             coin = self._viewer_font_big.render('COIN', True, (255, 225, 80))
             self._screen.blit(msg, msg.get_rect(center=(screen_rect.centerx, screen_rect.y + screen_rect.h * 0.42)))
             self._screen.blit(coin, coin.get_rect(center=(screen_rect.centerx, screen_rect.y + screen_rect.h * 0.64)))
+            return
+
+        if self._screen_state == 'GAME OVER':
+            msg = self._viewer_font_big.render('GAME', True, (255, 80, 80))
+            over = self._viewer_font_big.render('OVER', True, (255, 80, 80))
+            self._screen.blit(msg, msg.get_rect(center=(screen_rect.centerx, screen_rect.y + screen_rect.h * 0.42)))
+            self._screen.blit(over, over.get_rect(center=(screen_rect.centerx, screen_rect.y + screen_rect.h * 0.64)))
             return
 
         if self._screen_state == 'LOADING GAME':
@@ -771,13 +947,32 @@ class RobotArm:
     def step(self, action_idx: int):
         if self._closed:
             return
-        if self._screen_state == 'LOADING GAME':
+        self.begin_action(action_idx)
+        self.tick()
+
+    def begin_action(self, action_idx: int):
+        """Set the arm/joystick/button targets for one decision (no sim/render)."""
+        if self._closed:
+            return
+        if self._screen_state in ('LOADING GAME', 'INSERT COIN'):
             self._screen_state = 'GAME RUNNING'
         self.joystick_arm.step(action_idx)
         self.button_arm.step(action_idx)
+        # During play both hands stay closed: one grips the stick, one rests
+        # as a fist on the button.
+        self.joystick_arm.set_gripper(0.0)
+        self.button_arm.set_gripper(0.0)
+
+    def tick(self, force_draw: bool = False):
+        """Advance physics one slice and render once. Call several times per
+        decision to animate the robot smoothly at real-time speed."""
+        if self._closed:
+            return
         for _ in range(self._sim_steps):
             p.stepSimulation(physicsClientId=self.client)
-        self._draw_software_viewer()
+        self.joystick_arm.update_gripper()
+        self.button_arm.update_gripper()
+        self._draw_software_viewer(force=force_draw)
 
     def close(self):
         if self._closed:

@@ -254,7 +254,8 @@ class DonkeyKongEnv:
     def __init__(self, render=False, custom_integration_path=None,
                  provide_frame=False, provide_detect=False,
                  use_checkpoints=False, force_highest=False,
-                 static_teal_mask=None, broken_zones=None):
+                 static_teal_mask=None, broken_zones=None,
+                 frame_send_every=None):
         if custom_integration_path:
             retro.data.Integrations.add_custom_path(custom_integration_path)
             inttype = retro.data.Integrations.CUSTOM_ONLY
@@ -278,6 +279,9 @@ class DonkeyKongEnv:
         self._static_broken_zones = broken_zones  # None means detect dynamically at reset
         self._provide_frame   = provide_frame
         self._provide_detect = provide_detect
+        # How often to attach the full-colour frame for the arm cabinet / ghost viewer.
+        # 1 = every decision (smooth cabinet during eval); default keeps training light.
+        self._frame_send_every = frame_send_every or FRAME_SEND_EVERY
         self._frames        = collections.deque(maxlen=FRAME_STACK)
         self._prev_lives    = 3
         self._prev_mario_y  = MARIO_Y_START
@@ -547,7 +551,7 @@ class DonkeyKongEnv:
         info['_broken_zones'] = self._broken_zones
 
         # Full-res color frame for ghost viewer background — throttled to reduce pipe load
-        if self._provide_frame and self._step_count % FRAME_SEND_EVERY == 0:
+        if self._provide_frame and self._step_count % self._frame_send_every == 0:
             info['_raw_frame'] = obs
 
         # Reuse the already-resized small frame — no second resize needed

@@ -47,6 +47,9 @@ def parse_args():
                    choices=['pybullet', 'software'],
                    help='Arm GUI backend: pybullet OpenGL GUI or software Pygame viewer')
     p.add_argument('--real-arms',   action='store_true', help='Use real UR3 arms (reads robot_config.json)')
+    p.add_argument('--play-speed',  type=float, default=2.0,
+                   help='Eval real-time pacing multiplier (1.0 = true arcade speed, '
+                        '2.0 = default/looks best, 0 = unlimited)')
     p.add_argument('--load-model',  type=str,   default=None,
                    help='DQN: path to .pt file; PPO: path without .zip extension')
     p.add_argument('--eval-only',   action='store_true')
@@ -77,6 +80,7 @@ def main():
             ghost_viewer=args.render,
             use_checkpoints=args.checkpoints or args.force_highest,
             force_highest=args.force_highest,
+            play_speed=args.play_speed,
         )
     else:
         from training.train import train

@@ -16,12 +16,14 @@ class DonkeyKongGymEnv(gym.Env):
     def __init__(self, render=False, custom_integration_path=None,
                  provide_frame=False, provide_detect=False,
                  use_checkpoints=False, force_highest=False,
-                 static_teal_mask=None, broken_zones=None):
+                 static_teal_mask=None, broken_zones=None,
+                 frame_send_every=None):
         super().__init__()
         self._env = DonkeyKongEnv(render=render, custom_integration_path=custom_integration_path,
                                   provide_frame=provide_frame, provide_detect=provide_detect,
                                   use_checkpoints=use_checkpoints, force_highest=force_highest,
-                                  static_teal_mask=static_teal_mask, broken_zones=broken_zones)
+                                  static_teal_mask=static_teal_mask, broken_zones=broken_zones,
+                                  frame_send_every=frame_send_every)
         # Channels-first (C, H, W) — NatureCNN uses shape[0] as n_input_channels.
         # normalize_images=False is set in train_ppo so SB3 accepts float32 0-1.
         # Channel 5 is the teal/ladder binary mask so the CNN can explicitly see ladders.
