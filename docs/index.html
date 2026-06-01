@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Donkey Kong AI — Arcade Portfolio</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+<style>
+/* ===== RESET ===== */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+/* ===== ROOT / ARCADE PALETTE ===== */
+:root {
+  --bg:       #0a0a12;
+  --crt-bg:   #08080e;
+  --blue:     #3b5bdb;
+  --red:      #d32f2f;
+  --yellow:   #fdd835;
+  --cyan:     #00e5ff;
+  --orange:   #ff9100;
+  --white:    #e8e8f0;
+  --dim:      #8888aa;
+  --girder:   #4466cc;
+  --glow:     rgba(253, 216, 53, 0.06);
+  --font:     'Press Start 2P', monospace;
+}
+
+body {
+  background: var(--bg);
+  color: var(--white);
+  font-family: var(--font);
+  font-size: 11px;
+  line-height: 2;
+  overflow-x: hidden;
+}
+
+/* ===== CRT OVERLAY ===== */
+body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 9999;
+  background: repeating-linear-gradient(
+    0deg,
+    rgba(0,0,0,0.12) 0px,
+    rgba(0,0,0,0.12) 1px,
+    transparent 1px,
+    transparent 3px
+  );
+}
+
+/* ===== SCANLINE FLICKER ===== */
+@keyframes flicker {
+  0%, 100% { opacity: 0.97; }
+  50%      { opacity: 1;    }
+}
+body { animation: flicker 0.08s infinite; }
+
+/* ===== LAYOUT ===== */
+.arcade-frame {
+  max-width: 820px;
+  margin: 0 auto;
+  padding: 24px 20px 80px;
+}
+
+/* ===== TITLE BLOCK (mimics the DK title screen) ===== */
+.title-block {
+  text-align: center;
+  padding: 48px 0 28px;
+}
+
+.title-block h1 {
+  font-size: 36px;
+  color: var(--cyan);
+  text-shadow: 0 0 20px rgba(0, 229, 255, 0.4), 3px 3px 0 #1a1a3a;
+  letter-spacing: 4px;
+  line-height: 1.4;
+}
+
+.title-block h1 .red  { color: var(--red); }
+.title-block h1 .yellow { color: var(--yellow); }
+
+.title-sub {
+  margin-top: 12px;
+  font-size: 10px;
+  color: var(--dim);
+  letter-spacing: 2px;
+}
+
+/* ===== MENU (navigation, DK title-screen style) ===== */
+.menu {
+  list-style: none;
+  padding: 20px 0 32px;
+  text-align: center;
+}
+
+.menu li {
+  padding: 6px 0;
+  font-size: 12px;
+  cursor: pointer;
+  position: relative;
+  transition: color 0.15s;
+}
+
+.menu li::before {
+  content: '';
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-right: 14px;
+  background: transparent;
+  transition: background 0.15s;
+}
+
+.menu li:hover,
+.menu li.active {
+  color: var(--yellow);
+}
+
+.menu li:hover::before,
+.menu li.active::before {
+  background: var(--yellow);
+}
+
+.menu a {
+  color: inherit;
+  text-decoration: none;
+}
+
+/* ===== SECTIONS ===== */
+section {
+  margin-bottom: 48px;
+  padding-top: 24px;
+}
+
+section h2 {
+  font-size: 16px;
+  color: var(--cyan);
+  text-shadow: 0 0 12px rgba(0, 229, 255, 0.25);
+  border-bottom: 2px solid var(--girder);
+  padding-bottom: 8px;
+  margin-bottom: 20px;
+  letter-spacing: 2px;
+}
+
+section h3 {
+  font-size: 12px;
+  color: var(--orange);
+  margin: 20px 0 10px;
+}
+
+p, li {
+  color: var(--white);
+  font-size: 10px;
+  line-height: 2.2;
+}
+
+ul, ol {
+  padding-left: 28px;
+}
+
+/* ===== GIRDER DIVIDER ===== */
+.girder {
+  height: 6px;
+  margin: 32px 0;
+  background: repeating-linear-gradient(
+    90deg,
+    var(--girder) 0px,
+    var(--girder) 18px,
+    transparent 18px,
+    transparent 22px
+  );
+  border-radius: 2px;
+  opacity: 0.5;
+}
+
+/* ===== VIDEO EMBED ===== */
+.video-container {
+  position: relative;
+  width: 100%;
+  padding-bottom: 56.25%;
+  background: var(--crt-bg);
+  border: 3px solid var(--red);
+  border-radius: 4px;
+  overflow: hidden;
+  box-shadow: 0 0 30px rgba(211, 47, 47, 0.15), inset 0 0 60px rgba(0,0,0,0.5);
+}
+
+.video-container iframe {
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%; height: 100%;
+  border: none;
+}
+
+.video-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  color: var(--dim);
+  font-size: 10px;
+  letter-spacing: 2px;
+}
+
+.video-placeholder .coin {
+  width: 28px; height: 28px;
+  background: var(--yellow);
+  border-radius: 50%;
+  animation: coin-spin 1.2s ease-in-out infinite;
+  box-shadow: 0 0 12px rgba(253, 216, 53, 0.5);
+}
+
+@keyframes coin-spin {
+  0%, 100% { transform: scaleX(1); }
+  50%      { transform: scaleX(0.15); }
+}
+
+/* ===== CODE BLOCKS ===== */
+pre {
+  background: #0e0e18;
+  border: 1px solid #2a2a40;
+  border-left: 3px solid var(--cyan);
+  padding: 14px 18px;
+  margin: 12px 0;
+  overflow-x: auto;
+  font-family: var(--font);
+  font-size: 9px;
+  line-height: 2.2;
+  color: var(--cyan);
+  border-radius: 2px;
+}
+
+/* ===== TABLES ===== */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 12px 0;
+  font-size: 9px;
+}
+
+th {
+  text-align: left;
+  color: var(--yellow);
+  border-bottom: 2px solid var(--girder);
+  padding: 8px 10px;
+}
+
+td {
+  padding: 6px 10px;
+  border-bottom: 1px solid #1a1a2e;
+  color: var(--white);
+}
+
+tr:hover td {
+  background: rgba(59, 91, 219, 0.08);
+}
+
+/* ===== TEAM CARDS ===== */
+.team-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 16px;
+  margin-top: 16px;
+}
+
+.team-card {
+  background: #0e0e1a;
+  border: 2px solid var(--girder);
+  border-radius: 4px;
+  padding: 18px;
+  text-align: center;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.team-card:hover {
+  border-color: var(--yellow);
+  box-shadow: 0 0 16px rgba(253, 216, 53, 0.12);
+}
+
+.team-card .name {
+  font-size: 11px;
+  color: var(--yellow);
+  margin-bottom: 6px;
+}
+
+.team-card .role {
+  font-size: 8px;
+  color: var(--dim);
+  line-height: 2;
+}
+
+/* ===== FOOTER ===== */
+footer {
+  text-align: center;
+  padding: 32px 0 24px;
+  font-size: 8px;
+  color: var(--dim);
+  letter-spacing: 2px;
+}
+
+footer a {
+  color: var(--cyan);
+  text-decoration: none;
+}
+
+footer a:hover {
+  color: var(--yellow);
+}
+
+/* ===== SCROLL BEHAVIOUR ===== */
+html { scroll-behavior: smooth; }
+
+/* ===== RESPONSIVE ===== */
+@media (max-width: 600px) {
+  .title-block h1 { font-size: 22px; }
+  .menu li { font-size: 10px; }
+  section h2 { font-size: 13px; }
+  .team-grid { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+
+<div class="arcade-frame">
+
+  <!-- ===== TITLE SCREEN ===== -->
+  <div class="title-block">
+    <h1>
+      <span class="red">DONKEY</span><br>
+      <span class="yellow">KONG</span> AI
+    </h1>
+    <div class="title-sub">41118 ARTIFICIAL INTELLIGENCE IN ROBOTICS</div>
+  </div>
+
+  <!-- ===== MENU (DK style) ===== -->
+  <ul class="menu" id="nav-menu">
+    <li class="active"><a href="#about">ABOUT THE PROJECT</a></li>
+    <li><a href="#demo">DEMO VIDEO</a></li>
+    <li><a href="#how-it-works">HOW IT WORKS</a></li>
+    <li><a href="#robot-arms">ROBOT ARMS</a></li>
+    <li><a href="#setup">SETUP INSTRUCTIONS</a></li>
+    <li><a href="#team">THE TEAM</a></li>
+  </ul>
+
+  <div class="girder"></div>
+
+  <!-- ===== ABOUT ===== -->
+  <section id="about">
+    <h2>ABOUT THE PROJECT</h2>
+    <p>
+      A reinforcement learning agent that learns to play Donkey Kong (NES) entirely by itself.
+      It uses <span style="color:var(--orange)">PPO</span> (Proximal Policy Optimisation) and a
+      convolutional neural network to watch the game screen and decide which buttons to press — 
+      no human gameplay data, no hard-coded rules.
+    </p>
+    <p style="margin-top:12px">
+      The AI's decisions are mirrored in real time by a pair of simulated
+      <span style="color:var(--cyan)">KUKA IIWA</span> robot arms inside a PyBullet physics
+      environment: one grips a joystick, the other presses a jump button on a virtual arcade
+      cabinet — complete with coin insertion, a GAME OVER restart loop, and the actual game
+      rendered on the cabinet screen.
+    </p>
+  </section>
+
+  <div class="girder"></div>
+
+  <!-- ===== DEMO VIDEO ===== -->
+  <section id="demo">
+    <h2>DEMO VIDEO</h2>
+    <div class="video-container">
+      <!-- Replace the placeholder below with a YouTube/Vimeo embed:
+           <iframe src="https://www.youtube.com/embed/YOUR_VIDEO_ID"
+                   allowfullscreen></iframe>
+      -->
+      <div class="video-placeholder">
+        <div class="coin"></div>
+        <span>INSERT COIN</span>
+        <span style="font-size:8px; margin-top:4px;">(video coming soon)</span>
+      </div>
+    </div>
+  </section>
+
+  <div class="girder"></div>
+
+  <!-- ===== HOW IT WORKS ===== -->
+  <section id="how-it-works">
+    <h2>HOW IT WORKS</h2>
+
+    <h3>THE AI</h3>
+    <p>
+      The agent receives a stack of preprocessed game frames (greyscale + sprite channels)
+      and outputs one of 8 discrete actions every decision step. A reward function encourages
+      climbing higher, dodging barrels, and reaching Pauline at the top.
+    </p>
+
+    <h3>TRAINING</h3>
+    <p>
+      PPO runs across multiple parallel NES emulators (via stable-retro), collecting rollouts
+      and updating the CNN policy. Platform checkpoints let the agent drill individual
+      transitions (curriculum learning). 10M+ timesteps are recommended for consistent climbing.
+    </p>
+
+    <h3>OBSERVATION STACK</h3>
+    <table>
+      <tr><th>Channel</th><th>Contents</th></tr>
+      <tr><td>0–3</td><td>Greyscale frame stack (4 consecutive frames)</td></tr>
+      <tr><td>4</td><td>Barrel positions (OAM sprite data)</td></tr>
+      <tr><td>5</td><td>Ladder mask (teal pixel detection)</td></tr>
+      <tr><td>6</td><td>Fireball positions (OAM sprite data)</td></tr>
+    </table>
+
+    <h3>ACTION MAP</h3>
+    <table>
+      <tr><th>Index</th><th>Action</th></tr>
+      <tr><td>0</td><td>NOOP</td></tr>
+      <tr><td>1</td><td>LEFT</td></tr>
+      <tr><td>2</td><td>RIGHT</td></tr>
+      <tr><td>3</td><td>UP (climb)</td></tr>
+      <tr><td>4</td><td>DOWN</td></tr>
+      <tr><td>5</td><td>JUMP</td></tr>
+      <tr><td>6</td><td>JUMP + LEFT</td></tr>
+      <tr><td>7</td><td>JUMP + RIGHT</td></tr>
+    </table>
+  </section>
+
+  <div class="girder"></div>
+
+  <!-- ===== ROBOT ARMS ===== -->
+  <section id="robot-arms">
+    <h2>ROBOT ARMS</h2>
+    <p>
+      Two KUKA IIWA 7-DOF arms share a PyBullet physics world with a virtual arcade cabinet.
+      Each AI action maps to a physical movement in real time:
+    </p>
+
+    <table>
+      <tr><th>Action</th><th>Joystick Arm (blue)</th><th>Button Arm (orange)</th></tr>
+      <tr><td>NOOP</td><td>Centred</td><td>Raised</td></tr>
+      <tr><td>LEFT / RIGHT</td><td>Tilts left / right</td><td>Raised</td></tr>
+      <tr><td>UP / DOWN</td><td>Tilts forward / back</td><td>Raised</td></tr>
+      <tr><td>JUMP</td><td>Centred</td><td>Presses button</td></tr>
+      <tr><td>JUMP + dir</td><td>Tilts in direction</td><td>Presses button</td></tr>
+    </table>
+
+    <h3>KEY FEATURES</h3>
+    <ul>
+      <li>Parallel-jaw grippers with animated open/close on both arms</li>
+      <li>Autonomous coin-start loop — robot re-inserts a coin on GAME OVER</li>
+      <li>Low-pass filtered joystick (no jitter from policy sampling noise)</li>
+      <li>Real-time pacing synced to true NES frame rate</li>
+      <li>Live game feed rendered on the arcade cabinet screen (256&times;224)</li>
+    </ul>
+  </section>
+
+  <div class="girder"></div>
+
+  <!-- ===== SETUP INSTRUCTIONS ===== -->
+  <section id="setup">
+    <h2>SETUP INSTRUCTIONS</h2>
+
+    <h3>1. INSTALL WSL2</h3>
+    <p>Open PowerShell as Administrator and run:</p>
+    <pre>wsl --install</pre>
+    <p>Restart your PC, then create a Linux username and password when Ubuntu opens.</p>
+
+    <h3>2. INSTALL PYTHON</h3>
+    <pre>sudo apt update
+sudo apt install python3 python3-pip python3-venv -y</pre>
+
+    <h3>3. CLONE THE REPO</h3>
+    <pre>cd ~
+git clone https://github.com/abaeljoseph/Donkey-Kong-AI.git
+cd Donkey-Kong-AI
+git checkout Donkey-Kong-with-Robotics</pre>
+
+    <h3>4. SET UP VIRTUAL ENVIRONMENT</h3>
+    <pre>python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt</pre>
+
+    <h3>5. GET THE ROM</h3>
+    <p>
+      Obtain a <span style="color:var(--yellow)">Donkey Kong.nes</span> ROM file (not included — copyright)
+      and copy it into the project folder, then register it:
+    </p>
+    <pre>python setup_rom.py</pre>
+
+    <h3>6. TRAIN THE AI</h3>
+    <pre># Headless (fastest)
+python main.py --algo ppo --timesteps 10000000 --num-envs 8
+
+# With game window
+python main.py --algo ppo --timesteps 10000000 --num-envs 8 --render</pre>
+
+    <h3>7. WATCH IT PLAY</h3>
+    <pre># With robot arms + game window (NO GPU)
+python main.py --algo ppo --eval-only \
+  --load-model previous_archive/ppo59a_20m \
+  --num-envs 1 --arm-gui --arm-renderer software --render</pre>
+
+    <h3>COMMAND REFERENCE</h3>
+    <table>
+      <tr><th>Flag</th><th>What it does</th></tr>
+      <tr><td>--algo ppo</td><td>Use the PPO algorithm (required)</td></tr>
+      <tr><td>--timesteps N</td><td>Training steps (e.g. 10000000)</td></tr>
+      <tr><td>--num-envs N</td><td>Parallel games (set to CPU core count)</td></tr>
+      <tr><td>--render</td><td>Open game window + ghost viewer</td></tr>
+      <tr><td>--eval-only</td><td>Watch the model play (no training)</td></tr>
+      <tr><td>--load-model PATH</td><td>Load a saved checkpoint</td></tr>
+      <tr><td>--arm-gui</td><td>Show 3D robot arm window</td></tr>
+      <tr><td>--arm-renderer software</td><td>CPU renderer (no GPU needed)</td></tr>
+      <tr><td>--play-speed N</td><td>Playback speed (default 2.0)</td></tr>
+      <tr><td>--checkpoints</td><td>Curriculum learning (platform drilling)</td></tr>
+    </table>
+  </section>
+
+  <div class="girder"></div>
+
+  <!-- ===== TEAM ===== -->
+  <section id="team">
+    <h2>THE TEAM</h2>
+    <div class="team-grid">
+      <div class="team-card">
+        <div class="name">MEMBER 1</div>
+        <div class="role">Environment wrapper, reward shaping,<br>OAM sprite detection, ghost viewer</div>
+      </div>
+      <div class="team-card">
+        <div class="name">MEMBER 2</div>
+        <div class="role">CNN feature extractor</div>
+      </div>
+      <div class="team-card">
+        <div class="name">MEMBER 3</div>
+        <div class="role">DQN agent &amp; replay buffer</div>
+      </div>
+      <div class="team-card">
+        <div class="name">MEMBER 4</div>
+        <div class="role">Evaluation metrics &amp; result plots</div>
+      </div>
+    </div>
+  </section>
+
+  <div class="girder"></div>
+
+  <!-- ===== FOOTER ===== -->
+  <footer>
+    <p>&copy; 2026 DONKEY KONG AI &mdash; UNIVERSITY PROJECT</p>
+    <p style="margin-top:8px">
+      <a href="https://github.com/abaeljoseph/Donkey-Kong-AI" target="_blank">
+        VIEW ON GITHUB
+      </a>
+    </p>
+  </footer>
+
+</div>
+
+<!-- ===== MENU HIGHLIGHT ON SCROLL ===== -->
+<script>
+(function() {
+  const items = document.querySelectorAll('#nav-menu li');
+  const sections = [];
+  items.forEach(li => {
+    const href = li.querySelector('a')?.getAttribute('href');
+    if (href) sections.push(document.querySelector(href));
+  });
+
+  function update() {
+    let idx = 0;
+    const y = window.scrollY + window.innerHeight * 0.3;
+    sections.forEach((s, i) => { if (s && s.offsetTop <= y) idx = i; });
+    items.forEach((li, i) => li.classList.toggle('active', i === idx));
+  }
+
+  window.addEventListener('scroll', update, { passive: true });
+  update();
+})();
+</script>
+
+</body>
+</html>
