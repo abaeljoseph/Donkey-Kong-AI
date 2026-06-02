@@ -313,7 +313,7 @@ def train_ppo(
         # Opening coin-insert: run it here (after the model + env are loaded)
         # rather than during arm construction, which froze the first frame.
         if arm is not None and hasattr(arm, 'run_coin_insert'):
-            arm.run_coin_insert(game_over=False)
+            arm.run_coin_insert(outcome=None)
 
         # Real-time pacing: one decision = FRAME_SKIP NES frames @ 60 Hz.
         # Pacing the loop to this period makes the game and the arm tick together
@@ -356,11 +356,17 @@ def train_ppo(
                 print(f'  {ep_count:4d}  {ep_reward:8.1f}  {plat:>20}  {note}')
                 metrics.log_episode(reward=ep_reward, steps=0, deaths=ep_deaths,
                                     won=ep_won, loss=0.0, eps=0.0)
-                # Arcade coin-start loop: when the game truly ends (all lives lost
-                # or a win), the robot physically re-inserts a coin to start again.
-                round_over = bool(infos[0].get('gameover')) or ep_won
-                if arm is not None and round_over and hasattr(arm, 'run_coin_insert'):
-                    arm.run_coin_insert(game_over=True)
+                # Arcade coin-start loop: when the round truly ends the robot
+                # physically re-inserts a coin to start again.  Show WINNER! if
+                # Mario cleared the stage, GAME OVER only if he actually died.
+                if ep_won:
+                    outcome = 'win'
+                elif bool(infos[0].get('gameover')):
+                    outcome = 'loss'
+                else:
+                    outcome = None   # timeout/other: silent restart, no end screen
+                if arm is not None and outcome is not None and hasattr(arm, 'run_coin_insert'):
+                    arm.run_coin_insert(outcome=outcome)
                     deadline = time.perf_counter()   # resync clock after the animation
                 ep_reward, ep_best_y = 0.0, 999
                 ep_deaths, ep_prev_lives, ep_won = 0, None, False

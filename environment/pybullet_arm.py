@@ -30,8 +30,12 @@ import pybullet_data
 # How far the joystick arm deflects the EEF from centre (metres)
 JOYSTICK_DEFLECT   = 0.035
 
-# How far the button arm presses down (metres)
-BUTTON_PRESS_DEPTH = 0.032
+# How far the button arm presses down (metres).  Kept shallow so the gripper
+# only dips onto the cap and never looks like it sinks through the button.
+BUTTON_PRESS_DEPTH = 0.016
+# Extra height the button arm hovers above the cap (metres), applied to both
+# the rest and pressed poses so the gripper sits clearly above the button.
+BUTTON_HOVER_LIFT = 0.016
 
 # How much the joystick shaft visually tilts (radians, ~17°)
 _JOYSTICK_TILT = 0.30
@@ -98,14 +102,45 @@ _SOFTWARE_VIEW_FPS = 24.0
 # at 2.0x playback (the speed this looks best at).
 _SOFTWARE_MAX_RENDER_DIM = 512
 
-# The control deck box spans Y 0.22–0.58.  The arm must stay OUTSIDE (Y < 0.22)
-# or ABOVE (Z > 0.32) the deck at all times.  Path: pickup (above deck) →
-# swing out in front (Y < 0.22, high Z) → lower to slot height still in front →
-# push coin inward (+Y) into the front-face slot.
-COIN_PICKUP_POS    = (0.28, 0.31, 0.42)    # tray, above the deck (Z > 0.32) ✓
+# ---------------------------------------------------------------------------
+# Cabinet keep-out zones
+# ---------------------------------------------------------------------------
+# Axis-aligned solid volumes (world space) the robot end-effector must NEVER
+# enter, expressed as (xmin, xmax, ymin, ymax, zmin, zmax).  The control deck
+# and lower cabinet body fill Y 0.18–0.90 up to Z ≈ 0.42.  The joystick/button
+# the arms actually operate sit ABOVE this (Z ≈ 0.46–0.52), so normal play is
+# unaffected — only the low coin reach is constrained.  Any commanded target
+# that lands inside a zone is pushed OUT toward the camera (−Y), so the arm
+# goes around the front of the cabinet instead of plunging down into it.
+_CABINET_KEEPOUT = [
+    (-0.50, 0.50, 0.18, 0.90, 0.00, 0.42),
+]
+# How far in front of a zone (−Y) to park a clamped target.
+_KEEPOUT_MARGIN = 0.04
+
+
+def _clamp_outside_cabinet(pos):
+    """Pull an EEF target out of any cabinet keep-out zone, toward the camera."""
+    x, y, z = pos
+    for xmin, xmax, ymin, ymax, zmin, zmax in _CABINET_KEEPOUT:
+        if xmin <= x <= xmax and ymin <= y <= ymax and zmin <= z <= zmax:
+            y = ymin - _KEEPOUT_MARGIN
+    return (x, y, z)
+
+
+# Coin choreography — a simple rectilinear pick-and-place that cannot clip the
+# cabinet:  grab → LIFT straight up → traverse HORIZONTALLY (high, above the
+# whole cabinet) to over the slot → lower straight DOWN to slot height → push
+# the coin forward into the front-face slot → straight back up and home.  Every
+# placement EEF target keeps Y < 0.18 (in front of the cabinet) so the down/up
+# legs never enter the keep-out body.
+COIN_LIFT_Z        = 0.55                   # traverse height, above the cabinet
+COIN_PICKUP_POS    = (0.30, 0.10, 0.40)    # floating tray, in front-right
+COIN_PICKUP_LIFT   = (0.30, 0.10, COIN_LIFT_Z)   # straight up from the tray
+COIN_OVER_SLOT     = (0.0, 0.13, COIN_LIFT_Z)    # high, directly above the slot
 COIN_SLOT_POS      = (0.0, 0.205, 0.30)    # coin door on the front face
-COIN_SLOT_APPROACH = (0.0, 0.12, 0.42)     # out in front of the cabinet, high up ✓
-COIN_SLOT_INSERT   = (0.0, 0.12, 0.30)     # lower to slot height, still in front ✓
+COIN_SLOT_INSERT   = (0.0, 0.13, 0.30)     # in front of the slot face (Y < 0.18)
+COIN_SLOT_APPROACH = COIN_OVER_SLOT        # retained alias for the over-slot point
 COIN_HALF_INSERTED = (0.0, 0.19, 0.30)
 _COIN_ORI = p.getQuaternionFromEuler([math.pi / 2.0, 0.0, 0.0])
 
@@ -303,7 +338,12 @@ class KukaArm:
             physicsClientId=self.client)
 
     def move_to(self, target_pos: tuple, target_ori: tuple = None):
-        """IK-drive the EEF to target_pos. Only re-solves when target changes."""
+        """IK-drive the EEF to target_pos. Only re-solves when target changes.
+
+        Targets are clamped out of the cabinet keep-out zones first, so the arm
+        is never asked to drive its end-effector into the arcade body.
+        """
+        target_pos = _clamp_outside_cabinet(tuple(target_pos))
         if target_pos == self._last_target:
             return
         self._last_target = target_pos
@@ -448,8 +488,8 @@ class ButtonKukaArm(KukaArm):
             colour=[0.92, 0.42, 0.12, 1.0],
         )
         bx, by, bz = BUTTON_REST
-        self._rest_pos  = BUTTON_REST
-        self._press_pos = (bx, by, bz - BUTTON_PRESS_DEPTH)
+        self._rest_pos  = (bx, by, bz + BUTTON_HOVER_LIFT)
+        self._press_pos = (bx, by, bz + BUTTON_HOVER_LIFT - BUTTON_PRESS_DEPTH)
         self._pressed   = False
         self._btn_body  = self._build_button()
         self.move_to(self._rest_pos)
@@ -666,15 +706,23 @@ class RobotArm:
                 time.sleep(1.0 / 60.0)
         self._set_coin_position(COIN_PICKUP_POS, visible=False)
 
-    def run_coin_insert(self, game_over=False):
+    def run_coin_insert(self, outcome=None):
         """
         Play the coin-insertion animation, then leave the screen on LOADING GAME
         so the next step() flips it to GAME RUNNING.  Replayable: call it again
-        after a game-over to physically start a fresh game.
+        after a round ends to physically start a fresh game.
+
+        outcome:
+            None    — first startup, no end-of-round screen.
+            'loss'  — Mario died before clearing the stage; show GAME OVER.
+            'win'   — Mario cleared the stage/map; show WINNER!.
         """
         if self._closed:
             return
-        if game_over:
+        if outcome == 'win':
+            print('[RobotArm] Stage cleared — WINNER! Re-inserting coin')
+            self._hold_screen('WINNER', frames=48)
+        elif outcome == 'loss':
             print('[RobotArm] Game over — re-inserting coin')
             self._hold_screen('GAME OVER', frames=48)
         else:
@@ -682,13 +730,20 @@ class RobotArm:
         self._screen_state = 'INSERT COIN'
         self._set_coin_position(COIN_PICKUP_POS)
         self._draw_software_viewer(force=True)
+        # Grab the coin off the tray.
         self._move_startup_segment(BUTTON_REST, COIN_PICKUP_POS, 10, coin_mode='table')
-        self._move_startup_segment(COIN_PICKUP_POS, COIN_SLOT_APPROACH, 14, coin_mode='hand')
-        self._move_startup_segment(COIN_SLOT_APPROACH, COIN_SLOT_INSERT, 8, coin_mode='hand')
+        # 1) LIFT straight up off the tray.
+        self._move_startup_segment(COIN_PICKUP_POS, COIN_PICKUP_LIFT, 8, coin_mode='hand')
+        # 2) Traverse HORIZONTALLY (high above the cabinet) to over the slot.
+        self._move_startup_segment(COIN_PICKUP_LIFT, COIN_OVER_SLOT, 12, coin_mode='hand')
+        # 3) Lower straight DOWN to slot height, still in front of the cabinet.
+        self._move_startup_segment(COIN_OVER_SLOT, COIN_SLOT_INSERT, 10, coin_mode='hand')
         self._screen_state = 'LOADING GAME'
-        self._drop_coin_into_slot()   # coin falls into the slot and disappears
-        self._move_startup_segment(COIN_SLOT_INSERT, COIN_SLOT_APPROACH, 6, coin_mode='hidden')
-        self._move_startup_segment(COIN_SLOT_APPROACH, BUTTON_REST, 12, coin_mode='hidden')
+        # 4) Push the coin forward into the front-face slot.
+        self._drop_coin_into_slot()
+        # 5) Retract straight UP, then horizontally back home — never into the body.
+        self._move_startup_segment(COIN_SLOT_INSERT, COIN_OVER_SLOT, 8, coin_mode='hidden')
+        self._move_startup_segment(COIN_OVER_SLOT, BUTTON_REST, 12, coin_mode='hidden')
 
     def _init_software_viewer(self):
         import pygame
@@ -845,6 +900,13 @@ class RobotArm:
             over = self._viewer_font_big.render('OVER', True, (255, 80, 80))
             self._screen.blit(msg, msg.get_rect(center=(screen_rect.centerx, screen_rect.y + screen_rect.h * 0.42)))
             self._screen.blit(over, over.get_rect(center=(screen_rect.centerx, screen_rect.y + screen_rect.h * 0.64)))
+            return
+
+        if self._screen_state == 'WINNER':
+            msg = self._viewer_font_big.render('WINNER', True, (90, 240, 120))
+            bang = self._viewer_font_big.render('!', True, (255, 225, 80))
+            self._screen.blit(msg, msg.get_rect(center=(screen_rect.centerx, screen_rect.y + screen_rect.h * 0.42)))
+            self._screen.blit(bang, bang.get_rect(center=(screen_rect.centerx, screen_rect.y + screen_rect.h * 0.64)))
             return
 
         if self._screen_state == 'LOADING GAME':

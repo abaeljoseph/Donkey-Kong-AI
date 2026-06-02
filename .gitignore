@@ -16,5 +16,10 @@ __pycache__/
 # retro SHA (generated locally by setup_rom.py)
 retro_data/*/rom.sha
 
+.venv
 .venv/
 stable-retro-src/
+stable-retro-src
+
+# Local Claude/agent settings — machine-specific, not for sharing
+.claude/
