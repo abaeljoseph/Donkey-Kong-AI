@@ -35,6 +35,14 @@ def parse_args():
     p.add_argument('--ppo-save-freq', type=int, default=50_000,    help='PPO: checkpoint every N steps')
     p.add_argument('--checkpoints',    action='store_true', help='Enable checkpoint spawning during training/eval')
     p.add_argument('--force-highest',  action='store_true', help='Always spawn at the highest saved checkpoint (implies --checkpoints)')
+    p.add_argument('--start-stage',    type=int, default=1, choices=[1, 2, 3, 4],
+                   help='Start every episode at the beginning of this stage (2-4 require a recorded start state)')
+    p.add_argument('--stage1-envs',   type=int, default=0,
+                   help='Reserve this many envs on stage 1 to prevent forgetting')
+    p.add_argument('--stage2-envs',   type=int, default=0,
+                   help='Reserve this many envs on stage 2 (requires a stage 2 start state)')
+    p.add_argument('--stage3-envs',   type=int, default=0,
+                   help='Reserve this many envs on stage 3 (requires a stage 3 start state)')
     # Shared
     p.add_argument('--num-envs',    type=int,   default=24,  help='Parallel environments')
     p.add_argument('--render',      action='store_true', help='Render game window (env 0 only)')
@@ -68,6 +76,10 @@ def main():
             ghost_viewer=args.render,
             use_checkpoints=args.checkpoints or args.force_highest,
             force_highest=args.force_highest,
+            start_stage=args.start_stage,
+            stage1_envs=args.stage1_envs,
+            stage2_envs=args.stage2_envs,
+            stage3_envs=args.stage3_envs,
         )
     else:
         from training.train import train

@@ -33,7 +33,7 @@ FRAME_W      = 84
 FRAME_STACK  = 4
 OBS_CHANNELS = 7    # 4 grayscale + teal/ladder + barrel + fire  (set to 8 to add hammer — requires retraining from scratch)
 FRAME_SKIP   = 8    # hold each action for N frames
-MAX_STEPS    = 1200 # decision steps per episode (randomised ±200 per env to stagger resets)
+MAX_STEPS    = 2000 # decision steps per episode (randomised ±200); increased for multi-stage runs
 
 GAME_NAME  = 'DonkeyKongOriginalEdition-Nes'
 GAME_STATE = '1Player.GameA'
@@ -63,7 +63,8 @@ BROKEN_LADDER_ZONES = [
 
 # Directory where platform game-states are persisted to disk.
 # All subprocesses share the same files so one env's discovery benefits the rest.
-GAMESTATE_DIR = os.path.join(os.path.dirname(__file__), '..', 'saved_models', 'gamestates')
+GAMESTATE_DIR    = os.path.join(os.path.dirname(__file__), '..', 'saved_models', 'gamestates')
+STAGE_STARTS_DIR = os.path.join(os.path.dirname(__file__), '..', 'saved_models', 'stage_starts')
 
 # Stage 4 rivet positions — detected by colour from the opening frame and cached.
 RIVET_POSITIONS_PATH = os.path.join(
@@ -96,6 +97,9 @@ def _best_gamestate_path() -> str:
 
 def _best_suspended_path() -> str:
     return os.path.join(GAMESTATE_DIR, 'best_suspended.flag')
+
+def _stage_start_path(stage: int) -> str:
+    return os.path.join(STAGE_STARTS_DIR, f'stage_{stage}_start.bin')
 
 
 def detect_broken_ladder_zones(hsv, h, w):
@@ -287,7 +291,8 @@ class DonkeyKongEnv:
                  provide_frame=False, provide_detect=False,
                  use_checkpoints=False, force_highest=False,
                  static_teal_mask=None, broken_zones=None,
-                 game_name=None, game_state=None):
+                 game_name=None, game_state=None,
+                 start_stage: int = 1):
         _game_name  = game_name  or GAME_NAME
         _game_state = game_state or GAME_STATE
         # 'none' sentinel = boot ROM from scratch without loading a save state.
@@ -310,8 +315,10 @@ class DonkeyKongEnv:
         self.action_space_n = NUM_ACTIONS
         self.observation_shape = (OBS_CHANNELS, FRAME_H, FRAME_W)
 
-        self._use_checkpoints   = use_checkpoints
-        self._force_highest     = force_highest
+        self._start_stage_override = start_stage
+        # Checkpoints are stage-1 platform saves — irrelevant when starting later stages.
+        self._use_checkpoints   = use_checkpoints and (start_stage == 1)
+        self._force_highest     = force_highest and (start_stage == 1)
         # Static maps computed once at startup — if provided, reset() skips HSV scanning entirely.
         self._static_teal_mask  = static_teal_mask
         self._static_broken_zones = broken_zones  # None means detect dynamically at reset
@@ -324,18 +331,28 @@ class DonkeyKongEnv:
         self._step_count    = 0
         self._last_teal       = np.zeros((FRAME_H, FRAME_W), dtype=np.float32)
         self._ladder_rects    = []   # (x0,y0,x1,y1) in screen pixels, updated once per stage
+        self._ladder_src_w    = 240  # obs frame width when ladder rects were scanned
+        self._ladder_src_h    = 224  # obs frame height when ladder rects were scanned
         self._ladder_template = None  # grayscale tile patch extracted from stage 1 ladder
         self._rescan_pending  = False # True after stage change; fires when Mario spawns at bottom
         self._rivet_positions   = []   # (x,y) frame pixel coords of rivets, detected at stage 4 start
         self._rivet_popped      = set() # VISUAL indices into _rivet_positions that have been collected
         self._rivet_game_popped = set() # GAME indices (0-7, = 0xC1+i) already assigned to visual slots
+        self._ep_stages_cleared = set() # stages cleared this episode (prevents double bonus)
         self._last_barrel   = np.zeros((FRAME_H, FRAME_W), dtype=np.float32)
         self._last_fire     = np.zeros((FRAME_H, FRAME_W), dtype=np.float32)
         self._last_hammer   = np.zeros((FRAME_H, FRAME_W), dtype=np.float32)
         self._max_steps        = MAX_STEPS
         self._reset_mario_y    = MARIO_Y_START
         self._best_y           = MARIO_Y_START
-        self._ep_best_y        = MARIO_Y_START
+        self._ep_best_y          = MARIO_Y_START
+        self._ep_cumulative_best = 0
+        self._prev_ladder_dx  = None   # for ladder attraction shaping
+        self._prev_rivet_dist = None   # for rivet attraction shaping
+        self._prev_fire_penalty   = 0.0  # fire proximity from last step (death cause)
+        self._prev_barrel_penalty = 0.0  # barrel proximity from last step (death cause)
+        self._stage_before_clear = 1   # stage value captured before RAM update each step
+        self._stage_clear_cooldown = 0 # steps remaining before stage_clear can fire again
         os.makedirs(GAMESTATE_DIR, exist_ok=True)
         self._platform_states        = []
         self._checkpoint_fail_streak = [0] * len(PLATFORM_THRESHOLDS)
@@ -415,6 +432,19 @@ class DonkeyKongEnv:
             noop_info = result[4] if len(result) > 4 else {}
             obs = result[0]
 
+        # Override: load a recorded stage-start state so training begins mid-game.
+        if self._start_stage_override > 1:
+            _ss_path = _stage_start_path(self._start_stage_override)
+            if os.path.exists(_ss_path):
+                with open(_ss_path, 'rb') as _sf:
+                    self.env.em.set_state(_sf.read())
+                for _ in range(4):
+                    result = self.env.step(_noop)
+                obs, _, _, _, noop_info = result
+            else:
+                print(f'[Warning] Stage {self._start_stage_override} start state not found: {_ss_path}')
+                print(f'          Play to stage {self._start_stage_override} in debug_env.py first to record it.')
+
         self._start_stage   = noop_info.get('stage', 0)
         self._current_stage = self._start_stage
         # Fallback: env.reset() returns (obs, info) — 2 values, not 5 — so noop_info
@@ -423,10 +453,25 @@ class DonkeyKongEnv:
             _ram = np.frombuffer(self.env.get_ram(), dtype=np.uint8)
             self._current_stage = int(_ram[83]) or 1
             self._start_stage   = self._current_stage
+        # Ensure stage is correct when using an override (RAM may briefly lag).
+        if self._start_stage_override > 1:
+            self._current_stage = self._start_stage_override
+            self._start_stage   = self._start_stage_override
         self._prev_lives    = noop_info.get('lives', 3)
         self._prev_mario_y = MARIO_Y_START
         self._step_count   = 0
         self._max_steps    = MAX_STEPS + random.randint(-200, 200)
+        # Pre-populate cleared stages and cumulative height for direct stage starts
+        # so the mountain reward correctly reflects total game progress.
+        self._ep_stages_cleared    = set(range(1, self._start_stage_override))
+        self._rescan_pending       = False
+        self._ep_cumulative_best   = (self._start_stage_override - 1) * TOTAL_HEIGHT
+        self._stage_before_clear   = self._start_stage_override
+        self._stage_clear_cooldown = 0
+        self._prev_ladder_dx  = None
+        self._prev_rivet_dist = None
+        self._prev_fire_penalty   = 0.0
+        self._prev_barrel_penalty = 0.0
 
         gray = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
         ram  = np.frombuffer(self.env.get_ram(), dtype=np.uint8)
@@ -435,12 +480,20 @@ class DonkeyKongEnv:
         self._reset_mario_y = self._prev_mario_y
         self._ep_best_y     = self._prev_mario_y
 
-        if self._static_teal_mask is not None:
-            # Static maps precomputed at startup — no HSV scan needed.
+        if self._static_teal_mask is not None and self._start_stage_override == 1:
+            # Static maps precomputed at startup — no HSV scan needed (stage 1 only).
             self._last_teal    = self._static_teal_mask
             self._broken_zones = self._static_broken_zones
+            # Ladder rects are needed for the zone-based on_ladder reward check.
+            # _rescan_stage_maps loads from the JSON cache (fast after first run) but
+            # also overwrites _last_teal — restore the static mask afterward so the
+            # observation channel stays identical to what the model was trained on.
+            if not self._ladder_rects:
+                self._rescan_stage_maps(obs)
+                self._last_teal    = self._static_teal_mask
+                self._broken_zones = self._static_broken_zones
         else:
-            # Dynamic scan fallback (debug tool, or future multi-stage support).
+            # Dynamic scan: used for stages 2-4 or when no static mask is provided.
             h, w = obs.shape[:2]
             hsv  = cv2.cvtColor(obs, cv2.COLOR_RGB2HSV)
             detected_raw = detect_broken_ladder_zones(hsv, h, w)
@@ -490,6 +543,9 @@ class DonkeyKongEnv:
         stage    = info.get('stage',    self._start_stage)
         level    = info.get('level',    0)
 
+        # Capture stage BEFORE updating from RAM — used for stage_clear attribution.
+        self._stage_before_clear = self._current_stage
+
         # On stage change, arm the pending flag — don't rescan yet because the transition
         # animation plays before the new layout is on-screen.  Fire only when Mario
         # appears at the bottom of the stage (OAM Y ≥ 150), which means he has spawned
@@ -497,6 +553,9 @@ class DonkeyKongEnv:
         if stage != self._current_stage and stage != 0:
             self._current_stage = stage
             self._rescan_pending = True
+
+        if self._stage_clear_cooldown > 0:
+            self._stage_clear_cooldown -= 1
 
         if self._rescan_pending:
             _oam_y = int(ram[512])   # OAM slot 0 Y; 0xFF/0xEF+ = off-screen
@@ -511,6 +570,7 @@ class DonkeyKongEnv:
         # nearest uncollected visual position and assign it.  When bytes flip back
         # to 0 (stage restart / game-over), clear everything.
         # Rivets persist through deaths in DK NES — no death reset needed.
+        _new_rivet_pops = 0
         if self._current_stage == 4 and self._rivet_positions:
             _any_reset = False
             for _gi in range(8):
@@ -519,15 +579,17 @@ class DonkeyKongEnv:
                     self._rivet_game_popped.add(_gi)
                     if _gi < len(self._rivet_positions):
                         self._rivet_popped.add(_gi)
+                        _new_rivet_pops += 1
                 elif _byte == 0 and _gi in self._rivet_game_popped:
                     _any_reset = True
             if _any_reset:
                 # Bytes reverted to 0 → stage restarted from scratch
                 self._rivet_popped      = set()
                 self._rivet_game_popped = set()
+                _new_rivet_pops         = 0
+                self._prev_rivet_dist   = None
 
         barrel_penalty, barrel_at_level = self._barrel_proximity_penalty_oam(mario_y, ram)
-        fire_penalty                    = self._fire_proximity_penalty_oam(mario_y, ram)
         dy_this_step                    = self._prev_mario_y - mario_y
         old_ep_best_y                   = self._ep_best_y
         mario_cx = mario_x + 8   # OAM X is left edge of 16px sprite; use centre for zone test
@@ -537,6 +599,16 @@ class DonkeyKongEnv:
             for z in self._broken_zones
         )
 
+        # Zone-based ladder check — OAM x converted to frame pixel space for rect comparison.
+        # No HSV/colour used: position comes from RAM, rects from cached stage scan.
+        _lcx = mario_cx * self._ladder_src_w / 256   # OAM x (0-255) → frame x
+        _lcy = mario_cy                               # mario_y already in 0-224 = frame y
+        on_ladder = any(
+            r[0] <= _lcx <= r[2] and r[1] <= _lcy <= r[3]
+            for r in self._ladder_rects
+        )
+        fire_penalty = self._fire_proximity_penalty_oam(mario_y, mario_cx, ram, on_ladder)
+
         self._ep_best_y = min(self._ep_best_y, mario_y)
         if in_broken_zone and action_idx == 3:
             # Pressing UP through a broken ladder: suppress the active climbing bonus
@@ -545,7 +617,7 @@ class DonkeyKongEnv:
             ladder_bonus          = 0.3   # passive only
             broken_ladder_penalty = -2.0
         else:
-            ladder_bonus          = self._ladder_climbing_bonus(action_idx, dy_this_step)
+            ladder_bonus          = self._ladder_climbing_bonus(action_idx, dy_this_step, on_ladder)
             broken_ladder_penalty = 0.0
         height_ref_y = old_ep_best_y
 
@@ -553,11 +625,6 @@ class DonkeyKongEnv:
         # _best_y is only advanced when we actually save, so if Mario is on a ladder at the
         # threshold height, we keep retrying until he's standing on the platform proper.
         if self._use_checkpoints and mario_y < self._best_y and mario_y > MARIO_Y_WIN and lives >= self._prev_lives and not gameover:
-            tx0 = max(0, int((mario_x - 20) * FRAME_W / 256))
-            tx1 = min(FRAME_W, int((mario_x + 20) * FRAME_W / 256))
-            ty0 = max(0, int(mario_y * FRAME_H / 224))
-            ty1 = min(FRAME_H, int((mario_y + 16) * FRAME_H / 224) + 1)
-            on_ladder = np.any(self._last_teal[ty0:ty1, tx0:tx1] > 0)
             if not on_ladder:
                 self._best_y = mario_y   # advance only on a successful save
                 state = None
@@ -614,16 +681,55 @@ class DonkeyKongEnv:
             else:
                 self._checkpoint_fail_streak[idx] = 0
 
-        reward, won = self._compute_reward(lives, mario_y, gameover, height_ref_y)
+        reward, won, stage_clear = self._compute_reward(lives, mario_y, gameover, height_ref_y)
         reward += barrel_penalty + fire_penalty + ladder_bonus + broken_ladder_penalty
+        reward += _new_rivet_pops * 40.0
+        reward += self._ladder_attraction_reward(mario_cx, mario_y, on_ladder)
+        reward += self._rivet_attraction_reward(mario_cx, mario_y)
+
+        # Death-cause attribution: use proximity from the PREVIOUS step (this step's
+        # OAM may already reflect post-death positions). Fire deaths get an extra hit
+        # because fireballs actively chase and the death is always avoidable.
+        if lives < self._prev_lives:
+            if self._prev_fire_penalty < -0.3:
+                reward -= 4.0   # died to fire/fireball
+            elif self._prev_barrel_penalty < -0.1:
+                reward -= 1.5   # died to barrel
+
+        self._prev_fire_penalty   = fire_penalty
+        self._prev_barrel_penalty = barrel_penalty
+
+        # Stage clear: mark this stage done, reset height tracker so the next stage
+        # gets its own full height reward, then let the episode continue naturally
+        # through the game's built-in stage transition animation.
+        if stage_clear:
+            self._ep_stages_cleared.add(self._stage_before_clear)
+            self._ep_best_y = MARIO_Y_START
+            self._stage_clear_cooldown = 30  # suppress false clears during transition animation
+            self._prev_ladder_dx  = None     # new stage has different ladder layout
+
+        # Level cycle: game has looped back to stage 1 on a harder difficulty round.
+        # Treat this as a full-game win and end the episode.
+        game_cycled = (level > 0 and self._current_stage == 1 and
+                       len(self._ep_stages_cleared) > 0)
+        if game_cycled:
+            won    = True
+            reward += 2000.0   # massive bonus for completing the full loop
 
         done = bool(gameover) or won or self._step_count >= self._max_steps
 
         # Reset height tracker when a life is lost so each new life gets the same
         # reward signal as the first — otherwise later lives have no height headroom
         # and the model learns to play differently depending on which life it's on.
+        # _ep_cumulative_best (not _ep_best_y) drives the actual height reward, so
+        # both must be reset. Keep the stage-cleared base so stage-2+ deaths don't
+        # reset back to 0 — only the within-stage climb resets.
         if lives < self._prev_lives:
             self._ep_best_y = MARIO_Y_START
+            _stages_done = len([s for s in self._ep_stages_cleared if s < self._current_stage])
+            self._ep_cumulative_best = _stages_done * TOTAL_HEIGHT
+            self._prev_ladder_dx  = None
+            self._prev_rivet_dist = None
             # Rivets reset on death in stage 4.  No explicit reset needed here because
             # step() already detects it: when 0xC1-C8 bytes revert from 1→0 after a
             # death, _any_reset fires and clears both popped sets.
@@ -632,11 +738,35 @@ class DonkeyKongEnv:
         self._prev_mario_y = mario_y
         self._prev_mario_x = mario_x
         info['_mario_y']      = mario_y
-        info['_stage']        = stage
+        info['_mario_x']      = mario_x
+        info['_stage']            = stage
+        info['_stage_just_cleared'] = self._stage_before_clear if stage_clear else 0
         info['_level']        = level
-        info['_step_reward']  = reward
-        info['_won']          = won
+        info['_step_reward']     = reward
+        info['_won']             = won
+        info['_stage_clear']     = stage_clear
+        info['_stages_cleared']     = len(self._ep_stages_cleared)
+        info['_cumulative_height']  = self._ep_cumulative_best
         info['_broken_zones'] = self._broken_zones
+        info['_ladder_rects'] = self._ladder_rects   # frame pixel coords
+
+        # OAM sprite positions for ghost viewer — barrels (slots 12-51) and fires (4-11)
+        _barrel_pts = []
+        for _g in range(10):
+            _sy = int(ram[512 + (12 + _g * 4) * 4])
+            _sx = int(ram[512 + (12 + _g * 4) * 4 + 3])
+            if _sy < 0xEF and _sx > 0:
+                _barrel_pts.append((_sx, _sy))   # raw OAM coords: x=0-255, y=0-240
+        _fire_pts = []
+        for _base in (4, 8):
+            _sy = int(ram[512 + _base * 4])
+            _sx = int(ram[512 + _base * 4 + 3])
+            if _sy < 0xEF and _sx > 0:
+                _fire_pts.append((_sx, _sy))     # raw OAM coords: x=0-255, y=0-240
+        info['_barrel_pts']      = _barrel_pts   # (oam_x 0-255, nes_y 0-224)
+        info['_fire_pts']        = _fire_pts
+        info['_rivet_positions'] = list(self._rivet_positions)  # frame pixel coords
+        info['_rivet_popped']    = list(self._rivet_popped)     # indices of collected rivets
 
         # Full-res color frame for ghost viewer background — throttled to reduce pipe load
         if self._provide_frame and self._step_count % FRAME_SEND_EVERY == 0:
@@ -687,33 +817,98 @@ class DonkeyKongEnv:
             return -0.2 * proximity_factor, at_level
         return 0.0, False
 
-    def _fire_proximity_penalty_oam(self, mario_y, ram):
-        """Penalty when fire (OAM slots 4-7 or 8-11) is within 20 NES px of Mario."""
-        fire_ys = []
+    def _fire_proximity_penalty_oam(self, mario_y, mario_cx_oam, ram, on_ladder):
+        """Penalty when fire (OAM slots 4-11) is within 35 NES px of Mario.
+        Fireballs are far more dangerous than barrels — penalty is much stronger.
+        Extra penalty when fire is directly above Mario on a ladder (can't dodge)."""
+        fire_pts = []
         for base in (4, 8):
-            sy = int(ram[512 + base * 4])
-            if sy < 0xEF:
-                fire_ys.append(int(sy * 224 / 240))
-        if not fire_ys:
+            ys, xs = [], []
+            for s in range(4):
+                slot = base + s
+                sy = int(ram[512 + slot * 4])
+                sx = int(ram[512 + slot * 4 + 3])
+                if sy < 0xEF and sx > 0:
+                    ys.append(int(sy * 224 / 240)); xs.append(sx)
+            if ys:
+                fire_pts.append((min(ys), min(xs)))
+        if not fire_pts:
             return 0.0
-        closest = float(min(abs(fy - mario_y) for fy in fire_ys))
-        if closest < 20:
-            return -0.2 * (1.0 - closest / 20.0)
-        return 0.0
 
-    def _ladder_climbing_bonus(self, action_idx, dy):
+        RADIUS = 35
+        penalty = 0.0
+        for fy, fx in fire_pts:
+            dy = abs(fy - mario_y)
+            dx = abs(fx - mario_cx_oam)
+            if dy < RADIUS:
+                prox = 1.0 - dy / RADIUS
+                penalty -= 1.0 * prox   # base penalty (5× old value)
+                # Extra penalty when fire is above and Mario is on a ladder — sitting
+                # under fire on a ladder is the single most avoidable death in DK.
+                if on_ladder and fy < mario_y and dy < 25 and dx < 20:
+                    penalty -= 1.5 * prox
+        return max(penalty, -3.0)
+
+    def _ladder_climbing_bonus(self, action_idx, dy, on_ladder: bool):
         """
-        +0.5 for actively climbing (UP + moving up + teal visible).
-        Small enough that cycling up-down gives only ~+0.10/step over idling, which the
-        height reward (+3 to +10 per new pixel) completely dominates — no farming incentive.
-        +0.3 passive when teal is visible — keeps the AI near ladders.
+        +0.5 for actively climbing (UP + moving up + inside a ladder zone).
+        +0.3 passive when inside a ladder zone — keeps the AI near ladders.
+        Zone check is OAM-position vs cached ladder rects — no HSV/colour used.
         """
-        teal_count = int(np.count_nonzero(self._last_teal))
-        if action_idx == 3 and dy > 0 and teal_count > 10:
+        if action_idx == 3 and dy > 0 and on_ladder:
             return 0.5
-        if teal_count > 10:
+        if on_ladder:
             return 0.3
         return 0.0
+
+    def _ladder_attraction_reward(self, mario_cx_oam, mario_y, on_ladder):
+        """Potential-based shaping: reward for moving horizontally toward the nearest
+        upward ladder reachable from Mario's current platform level.
+        Zero when already on a ladder. Not used on stage 4 (no height objective there)."""
+        if on_ladder or not self._ladder_rects or self._current_stage == 4:
+            return 0.0
+        if not self._ladder_src_w:
+            return 0.0
+
+        mario_fx = mario_cx_oam * self._ladder_src_w / 256
+
+        # Ladders whose bottom (y1/r[3]) is within REACH px of Mario's Y and whose
+        # top (y0/r[1]) is above Mario — these are entries to the next platform up.
+        REACH = 30
+        candidates = [
+            r for r in self._ladder_rects
+            if r[3] >= mario_y - REACH and r[1] < mario_y - 5
+        ]
+        if not candidates:
+            return 0.0
+
+        best_dx = min(abs((r[0] + r[2]) / 2.0 - mario_fx) for r in candidates)
+        prev = self._prev_ladder_dx
+        self._prev_ladder_dx = best_dx
+        if prev is None:
+            return 0.0
+        return (prev - best_dx) * 0.2
+
+    def _rivet_attraction_reward(self, mario_cx_oam, mario_y):
+        """Potential-based shaping: reward for moving toward the nearest uncollected
+        rivet on stage 4. Target resets automatically when a rivet is collected."""
+        if self._current_stage != 4 or not self._rivet_positions:
+            return 0.0
+
+        uncollected = [(x, y) for i, (x, y) in enumerate(self._rivet_positions)
+                       if i not in self._rivet_popped]
+        if not uncollected:
+            return 0.0
+
+        mario_fx  = mario_cx_oam * self._ladder_src_w / 256
+        best_dist = min(((x - mario_fx) ** 2 + (y - mario_y) ** 2) ** 0.5
+                        for x, y in uncollected)
+
+        prev = self._prev_rivet_dist
+        self._prev_rivet_dist = best_dist
+        if prev is None:
+            return 0.0
+        return (prev - best_dist) * 0.3
 
     def _barrel_proximity_penalty(self, hsv, mario_y, h):
         """
@@ -833,7 +1028,6 @@ class DonkeyKongEnv:
                         self._broken_zones = [tuple(z) for z in _data['broken_zones']]
                     else:
                         self._broken_zones = [] if stage != 1 else list(BROKEN_LADDER_ZONES)
-                    print(f'[Stage {stage}] Loaded {len(rects)} ladder rects from cache')
                     _cache_ok = True
             except (json.JSONDecodeError, KeyError, ValueError) as _e:
                 print(f'[Stage {stage}] Cache file corrupt ({_e}) — deleting and rescanning')
@@ -920,10 +1114,10 @@ class DonkeyKongEnv:
             self._rivet_positions = []
             self._rivet_popped    = set()
 
-        self._ladder_rects = rects
-        self._last_teal    = self._teal_from_rects(rects, h, w)
-        print(f'[Stage {stage}] {len(rects)} ladder segments, '
-              f'{len(self._broken_zones)} broken zones')
+        self._ladder_rects  = rects
+        self._ladder_src_w  = w
+        self._ladder_src_h  = h
+        self._last_teal     = self._teal_from_rects(rects, h, w)
 
     @staticmethod
     def _detect_ladders_color(gray, hsv, h, w, stage):
@@ -1320,18 +1514,40 @@ class DonkeyKongEnv:
     def _compute_reward(self, lives, mario_y, gameover, old_ep_best_y):
         reward = 0.0
 
-        # Progress-only height reward: only pay for NEW height reached this step.
-        # Revisiting old ground gives nothing, so farming the same ladder segment
-        # is unprofitable — every idle step costs the time penalty with no offset.
-        new_height_px = max(0.0, old_ep_best_y - mario_y)
-        height_progress = max(0.0, min(1.0, (MARIO_Y_START - mario_y) / TOTAL_HEIGHT))
-        climb_scale = 3.0 + height_progress * 7.0
-        reward += new_height_px * climb_scale
+        # Mountain height reward: stages 1-3 treated as a continuous climb.
+        # Cumulative height = stages_cleared * TOTAL_HEIGHT + current_stage_height,
+        # so height_progress and climb_scale naturally increase across stages.
+        # Stage 4 uses rivet rewards instead — no height reward there.
+        if self._current_stage < 4:
+            _stages_done  = len([s for s in self._ep_stages_cleared if s < self._current_stage])
+            _cur_h        = max(0.0, MARIO_Y_START - mario_y)
+            _cumulative_h = _stages_done * TOTAL_HEIGHT + _cur_h
+            new_height_px = max(0.0, _cumulative_h - self._ep_cumulative_best)
+            self._ep_cumulative_best = max(self._ep_cumulative_best, _cumulative_h)
+            # Stage 1 keeps its original scale (height_progress 0→1 within the stage).
+            # Later stages inherit a higher baseline so each pixel is worth more,
+            # making progression through the mountain genuinely more valuable.
+            height_progress = min(1.0, _cur_h / TOTAL_HEIGHT)
+            stage_base      = _stages_done / 3.0
+            climb_scale     = 3.0 + (stage_base + height_progress * (1.0 - stage_base)) * 7.0
+            reward += new_height_px * climb_scale
 
-        # Win — bonus scales with how fast Mario finished
-        won = mario_y <= MARIO_Y_WIN
+        # stage_clear: a non-final stage was beaten — give bonus but keep episode alive.
+        # won: the full game is beaten (stage 4 rivets all collected) — end episode.
+        if self._current_stage == 4:
+            won         = len(self._rivet_popped) >= 8
+            stage_clear = False
+        else:
+            stage_clear = (mario_y <= MARIO_Y_WIN and
+                           self._stage_before_clear not in self._ep_stages_cleared and
+                           self._stage_clear_cooldown == 0)
+            won = False   # game not finished until stage 4
+
+        speed_bonus = (self._max_steps - self._step_count) * 0.5
         if won:
-            reward += 500.0 + (self._max_steps - self._step_count) * 0.5
+            reward += 1000.0 + speed_bonus   # full game clear
+        elif stage_clear:
+            reward += 500.0 + speed_bonus    # stage clear, episode continues
 
         # Time penalty — discourages idling and hesitation
         reward -= 0.05
@@ -1343,4 +1559,4 @@ class DonkeyKongEnv:
         if gameover:
             reward -= 5.0
 
-        return reward, won
+        return reward, won, stage_clear
