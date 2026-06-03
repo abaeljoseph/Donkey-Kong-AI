@@ -266,6 +266,8 @@ tr:hover td {
   margin: 18px auto 4px;
   max-width: 760px;
   text-align: center;
+  position: relative;
+  z-index: 10000;
 }
 
 .figure img {
@@ -276,6 +278,8 @@ tr:hover td {
   border-radius: 4px;
   box-shadow: 0 0 24px rgba(0, 0, 0, 0.5);
   transition: border-color 0.2s;
+  position: relative;
+  z-index: 10000;
 }
 
 .figure img:hover { border-color: var(--cyan); }
@@ -435,7 +439,7 @@ html { scroll-behavior: smooth; }
         <div class="role">Built the robotic-arm simulation,<br>ported it to run on CPU-only machines,<br>created the project website</div>
       </div>
       <div class="team-card">
-        <img class="avatar" src="media/samir.png" alt="Samir" loading="lazy">
+        <img class="avatar" src="media/Samir.jpg" alt="Samir" loading="lazy">
         <div class="name">SAMIR</div>
         <div class="role">Real-time robotic-arm interaction,<br>lead video production,<br>early agent training experiments</div>
       </div>
