@@ -264,9 +264,12 @@ tr:hover td {
 /* ===== TEAM CARDS ===== */
 .team-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  grid-template-columns: repeat(2, 1fr);
   gap: 16px;
   margin-top: 16px;
+  max-width: 620px;
+  margin-left: auto;
+  margin-right: auto;
 }
 
 .team-card {
@@ -281,6 +284,24 @@ tr:hover td {
 .team-card:hover {
   border-color: var(--yellow);
   box-shadow: 0 0 16px rgba(253, 216, 53, 0.12);
+}
+
+.team-card .avatar {
+  width: 96px;
+  height: 96px;
+  margin: 0 auto 14px;
+  border: 3px solid var(--girder);
+  border-radius: 4px;
+  object-fit: cover;
+  image-rendering: auto;
+  display: block;
+  position: relative;
+  z-index: 10000;
+  transition: border-color 0.2s;
+}
+
+.team-card:hover .avatar {
+  border-color: var(--yellow);
 }
 
 .team-card .name {
@@ -527,20 +548,24 @@ python main.py --algo ppo --eval-only \
     <h2>THE TEAM</h2>
     <div class="team-grid">
       <div class="team-card">
-        <div class="name">MEMBER 1</div>
+        <img class="avatar" src="media/abael.jpeg" alt="Abael" loading="lazy">
+        <div class="name">ABAEL</div>
         <div class="role">Environment wrapper, reward shaping,<br>OAM sprite detection, ghost viewer</div>
       </div>
       <div class="team-card">
-        <div class="name">MEMBER 2</div>
-        <div class="role">CNN feature extractor</div>
+        <img class="avatar" src="media/ben.jpeg" alt="Ben" loading="lazy">
+        <div class="name">BEN</div>
+        <div class="role">Built the robotic-arm simulation,<br>ported it to run on CPU-only machines,<br>created the project website</div>
       </div>
       <div class="team-card">
-        <div class="name">MEMBER 3</div>
-        <div class="role">DQN agent &amp; replay buffer</div>
+        <img class="avatar" src="media/samir.png" alt="Samir" loading="lazy">
+        <div class="name">SAMIR</div>
+        <div class="role">Real-time robotic-arm interaction,<br>lead video production,<br>early agent training experiments</div>
       </div>
       <div class="team-card">
-        <div class="name">MEMBER 4</div>
-        <div class="role">Evaluation metrics &amp; result plots</div>
+        <img class="avatar" src="media/nikhil.jpeg" alt="Nikhil" loading="lazy">
+        <div class="name">NIKHIL</div>
+        <div class="role">Evaluated &amp; validated the agent's progress,<br>monitored training and ran the agent for<br>millions of sessions on his hardware</div>
       </div>
     </div>
   </section>
