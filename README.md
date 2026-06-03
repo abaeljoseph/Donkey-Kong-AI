@@ -60,15 +60,27 @@ If you have no NVIDIA GPU (e.g. AMD or no GPU), skip this step — it will run o
 
 ```bash
 cd ~
-git clone <your-repo-url>
-cd "Donkey Kong AI"
+git clone https://github.com/abaeljoseph/Donkey-Kong-AI.git
+cd Donkey-Kong-AI
+git checkout Donkey-Kong-with-Robotics
 ```
 
 > Important: clone inside the Linux filesystem (`~/`), NOT inside `/mnt/c/...`. Working from the Windows drive is much slower.
 
 ---
 
-## Step 5 — Install all Python dependencies
+## Step 5 — Create and activate a virtual environment
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+You should see `(.venv)` appear at the start of your prompt. **Every new WSL terminal needs the `source .venv/bin/activate` line before any other command** — otherwise Python will not find the installed packages.
+
+---
+
+## Step 6 — Install all Python dependencies
 
 ```bash
 pip install -r requirements.txt
@@ -80,11 +92,12 @@ This installs everything the project needs including:
 - `stable-retro` — NES emulator wrapper
 - `opencv-python` — frame processing
 - `pygame` — the ghost viewer and debug tools
+- `pybullet` — the robot arm physics simulation
 - `numpy`, `torch`, `tensorboard`
 
 ---
 
-## Step 6 — Get the ROM file
+## Step 7 — Get the ROM file
 
 You need a Donkey Kong NES ROM file. The ROM is not included in this repo (copyright).
 
@@ -92,18 +105,13 @@ You need a Donkey Kong NES ROM file. The ROM is not included in this repo (copyr
 
 2. Copy it from Windows into WSL:
    ```bash
-   cp /mnt/c/Users/YourName/Downloads/"Donkey Kong.nes" ~/
+   cp /mnt/c/Users/YourName/Downloads/"Donkey Kong.nes" ~/Donkey-Kong-AI/
    ```
    Replace `YourName` with your actual Windows username.
 
-3. Move it into the project folder:
-   ```bash
-   mv "Donkey Kong.nes" ~/"Donkey Kong AI"/
-   ```
-
 ---
 
-## Step 7 — Set up the ROM
+## Step 8 — Set up the ROM
 
 ```bash
 python setup_rom.py
@@ -113,37 +121,26 @@ This registers the ROM with the emulator and checks everything loads correctly. 
 
 ---
 
-## Step 8 — Activate the virtual environment
-
-Every time you open a new WSL terminal, run this before any other command:
-```bash
-source .venv/bin/activate
-```
-
-You should see `(.venv)` appear at the start of your prompt. If you skip this, Python will not find the installed packages.
-
----
-
 ## Step 9 — Train the AI
 
 **Train headless — fastest, recommended for overnight runs:**
 ```bash
-python main.py --algo ppo --timesteps 10000000 --num-envs 8
+python main.py --algo ppo --timesteps 20000000 --num-envs 8
 ```
 
 **Train and watch — opens game window and ghost viewer:**
 ```bash
-python main.py --algo ppo --timesteps 10000000 --num-envs 8 --render
+python main.py --algo ppo --timesteps 20000000 --num-envs 8 --render
 ```
 
 **With platform checkpoints (curriculum learning — Mario drills each platform):**
 ```bash
-python main.py --algo ppo --timesteps 10000000 --num-envs 8 --checkpoints
+python main.py --algo ppo --timesteps 20000000 --num-envs 8 --checkpoints
 ```
 
 **Continue training from a saved checkpoint:**
 ```bash
-python main.py --algo ppo --timesteps 10000000 --load-model saved_models/ppo_XXXXXX_steps
+python main.py --algo ppo --timesteps 20000000 --load-model saved_models/ppo_XXXXXX_steps
 ```
 Replace `ppo_XXXXXX_steps` with the filename of your latest checkpoint (without `.zip`). To find it:
 ```bash
@@ -183,7 +180,7 @@ TensorBoard data is saved to disk continuously during training. You can close an
 ## Step 11 — Watch the trained model play
 
 ```bash
-python main.py --algo ppo --eval-only --load-model saved_models/ppo_final --render --num-envs 1
+python main.py --algo ppo --eval-only --load-model previous_archive/ppo59a_20m --render --num-envs 1
 ```
 
 This opens the game window and shows the AI playing. Each episode prints the reward and highest platform Mario reached.
@@ -199,12 +196,21 @@ If the model was trained with a different observation shape (e.g. a different nu
 | Flag | What it does |
 |---|---|
 | `--algo ppo` | Use the PPO algorithm (required) |
-| `--timesteps N` | Total number of game steps to train for (e.g. `10000000`) |
+| `--timesteps N` | Total number of game steps to train for (e.g. `20000000`) |
 | `--num-envs N` | Number of parallel games running at once — set to your CPU core count |
 | `--render` | Open the game window and ghost viewer (for both training and eval) |
 | `--load-model PATH` | Load a saved model — exits with an error if the path is wrong |
 | `--eval-only` | Run the model without training — just watch it play |
 | `--ppo-save-freq N` | Save a checkpoint every N training steps (default: 50000) |
+
+### Robot arm flags
+
+| Flag | What it does |
+|---|---|
+| `--arm-gui` | Open the 3D PyBullet window showing both KUKA arms moving |
+| `--arm` | Run the arms headless (no window) — useful during training |
+| `--arm-renderer software` | CPU-only renderer — required for WSLg and machines without a working OpenGL GPU |
+| `--play-speed N` | Eval-time playback speed multiplier (default `2.0`; use `1.0` for true arcade speed, `0` for unlimited) |
 
 ### Spawn / checkpoint flags
 
@@ -218,12 +224,13 @@ If the model was trained with a different observation shape (e.g. a different nu
 
 | Goal | Command |
 |---|---|
-| Train from scratch (headless) | `python main.py --algo ppo --timesteps 10000000 --num-envs 8` |
-| Train and watch | `python main.py --algo ppo --timesteps 10000000 --num-envs 8 --render` |
-| Train with curriculum checkpoints | `python main.py --algo ppo --timesteps 10000000 --num-envs 8 --checkpoints` |
-| Continue training a saved model | `python main.py --algo ppo --timesteps 10000000 --load-model saved_models/ppo_XXXXXX_steps` |
-| Watch the final model play | `python main.py --algo ppo --eval-only --load-model saved_models/ppo_final --render --num-envs 1` |
-| Watch from the highest checkpoint | `python main.py --algo ppo --eval-only --load-model saved_models/ppo_final --render --num-envs 1 --force-highest` |
+| Train from scratch (headless) | `python main.py --algo ppo --timesteps 20000000 --num-envs 8` |
+| Train and watch | `python main.py --algo ppo --timesteps 20000000 --num-envs 8 --render` |
+| Train with curriculum checkpoints | `python main.py --algo ppo --timesteps 20000000 --num-envs 8 --checkpoints` |
+| Continue training a saved model | `python main.py --algo ppo --timesteps 20000000 --load-model saved_models/ppo_XXXXXX_steps` |
+| Watch the final model play | `python main.py --algo ppo --eval-only --load-model previous_archive/ppo59a_20m --render --num-envs 1` |
+| Watch with robot arms (any machine) | `python main.py --algo ppo --eval-only --load-model previous_archive/ppo59a_20m --num-envs 1 --arm-gui --arm-renderer software --render` |
+| Watch from the highest checkpoint | `python main.py --algo ppo --eval-only --load-model previous_archive/ppo59a_20m --render --num-envs 1 --force-highest` |
 
 ---
 
@@ -356,17 +363,19 @@ This replaces all HSV colour scanning for hazard detection — OAM reads are ins
 
 ## Robot Arms (Simulated)
 
-Two KUKA IIWA 7-DOF robot arms mirror what the AI is doing in real time:
+Two KUKA IIWA 7-DOF robot arms mirror what the AI is doing in real time, on a virtual arcade cabinet rendered around them:
 - **Left arm (blue)** — grips a joystick and tilts it left, right, forward or back to match the AI's directional input
 - **Right arm (orange)** — presses a button down whenever the AI jumps. The button turns red while held and yellow when released
+- **Live game on the cabinet screen** — the actual NES feed is rendered onto the arcade's screen at native 256×224 resolution
+- **Autonomous coin-start loop** — when a round ends, the button arm grabs a coin from the tray, lifts it over the cabinet, drops it down into the front coin slot, then play resumes
+- **End-of-round screen** — the cabinet shows **WINNER!** if Mario clears the stage, **GAME OVER** if he loses all lives, before re-inserting a coin
+- **Working parallel-jaw grippers** on both arms with open/close animation
+- **Low-pass filtered joystick** — smooths out the policy's per-frame action noise so the stick doesn't jitter
+- **Real-time pacing** — sub-frame interpolation keeps the arm animation smooth and locked to NES game speed (configurable with `--play-speed`)
 
 ### Install the robot arm dependency
 
-```bash
-pip install pybullet
-```
-
-If `pybullet` is already in `requirements.txt` it will have been installed in Step 5. You can confirm with:
+`pybullet` is in `requirements.txt` so it will have been installed in Step 6. You can confirm with:
 
 ```bash
 python -c "import pybullet; print('pybullet OK')"
@@ -374,35 +383,28 @@ python -c "import pybullet; print('pybullet OK')"
 
 ### Run with robot arms
 
-Watch the AI play with both arms moving in a separate 3D window:
+Watch the AI play with both arms moving in a separate 3D window (with a discrete GPU):
 
 ```bash
 python main.py --algo ppo --eval-only --load-model previous_archive/ppo59a_20m --num-envs 1 --arm-gui --render
 ```
 
-NO GPU:
-```bash 
+CPU-only / WSLg (recommended on most machines — no OpenGL needed):
+```bash
 python main.py --algo ppo --eval-only --load-model previous_archive/ppo59a_20m --num-envs 1 --arm-gui --arm-renderer software --render
 ```
 
 Watch arms only (no game window):
 
 ```bash
-python main.py --algo ppo --eval-only --load-model previous_archive/ppo59a_20m --num-envs 1 --arm-gui
+python main.py --algo ppo --eval-only --load-model previous_archive/ppo59a_20m --num-envs 1 --arm-gui --arm-renderer software
 ```
 
 Train with arms running in the background (headless, no GUI):
 
 ```bash
-python main.py --algo ppo --timesteps 10000000 --num-envs 8 --arm
+python main.py --algo ppo --timesteps 20000000 --num-envs 8 --arm
 ```
-
-### Robot arm flags
-
-| Flag | What it does |
-|---|---|
-| `--arm-gui` | Open the 3D PyBullet window showing both KUKA arms moving |
-| `--arm` | Run the arms headless (no window) — useful during training |
 
 ### How the arms work
 
@@ -428,7 +430,7 @@ environment/
   donkey_kong_env.py   # Core environment — reward, actions, OAM detection, frame processing
   gym_wrapper.py       # Wraps it for stable-baselines3
   ghost_viewer.py      # Live visualiser with height and reward charts
-  pybullet_arm.py      # Dual KUKA IIWA arm simulation driven by AI actions
+  pybullet_arm.py      # Dual KUKA IIWA arm simulation, arcade cabinet, coin-start loop
 training/
   train_ppo.py         # Training and evaluation loop with model validation
 evaluation/
@@ -437,6 +439,8 @@ evaluation/
 tools/
   test_broken_ladder.py  # Interactive debug tool — play manually, inspect OAM data live
   debug_detection.py     # Colour detection inspector (for ladder HSV tuning)
+  calibrate_arms.py      # Calibration helper for real UR3 arm deployment
+docs/                  # Arcade-themed project website (GitHub Pages)
 retro_data/            # NES game integration files (ROM not included)
 saved_models/          # Where checkpoints are saved during training
 ```
@@ -447,10 +451,10 @@ saved_models/          # Where checkpoints are saved during training
 
 | Person | Role |
 |---|---|
-| Person 1 | Environment wrapper, reward shaping, OAM sprite detection, ghost viewer |
-| Person 2 | CNN feature extractor |
-| Person 3 | DQN agent and replay buffer |
-| Person 4 | Evaluation metrics and result plots |
+| Abael | Environment wrapper, reward shaping, OAM sprite detection, ghost viewer |
+| Ben | Built the robotic-arm simulation, ported it to run on CPU-only machines, created the project website |
+| Samir | Real-time robotic-arm interaction, lead video production, early agent training experiments |
+| Nikhil | Evaluated and validated the agent's progress, monitored training and ran the agent for millions of sessions on his hardware |
 
 ---
 
@@ -458,21 +462,12 @@ saved_models/          # Where checkpoints are saved during training
 
 - The ROM is not in this repo — you must provide your own copy named `Donkey Kong.nes`
 - Saved models are not committed to git — share `.zip` files manually
-- At least 10 million timesteps recommended before the agent starts climbing consistently
-- GPU training (NVIDIA only) is 10–20× faster than CPU — change `device='cpu'` to `device='cuda'` in `training/train_ppo.py`
+- Around 20 million timesteps is the target for consistent climbing; the agent typically starts making real progress after ~10M
+- GPU training (NVIDIA only) is 10–20× faster than CPU. The device is auto-detected at runtime — if CUDA is available it will be used automatically, otherwise it falls back to CPU
 - Saved models trained before OAM-based detection was added (pre-7-channel) are incompatible — the script will detect this and tell you rather than crashing
 - To expand to 8 observation channels (adding a hammer channel): set `OBS_CHANNELS = 8` in `donkey_kong_env.py` and uncomment the hammer line in `_get_state()` — requires retraining from scratch
 - The level counter (NES RAM address 84) is 0-indexed internally — add 1 before displaying so L1 matches what the game shows
 - The stage register (NES RAM address 83) cycles 1 → 3 → 4 → 1, not 1 → 2 → 3 — slot 2 is reserved and skipped by the ROM
 - Each time you continue training from a checkpoint, TensorBoard creates a new run line — the previous run's graph is preserved separately
 - If `height/mean` in TensorBoard is flat after 300k steps, check `environment/donkey_kong_env.py` — the reward signal may need tuning
-
-
-## Running the enviorment with Robot arms
-
-- Install:
-pip install pybullet
-
-Run (arms + game window together):
-python main.py --algo ppo --eval-only --load-model previous_archive/ppo59a_20m --num-envs 1 --arm-gui --render
-
+- For the robot arm 3D window, use `--arm-renderer software` whenever you don't have a working OpenGL GPU (this includes most WSLg setups) — it renders on the CPU and is the most reliable backend

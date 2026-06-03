@@ -261,6 +261,33 @@ tr:hover td {
   background: rgba(59, 91, 219, 0.08);
 }
 
+/* ===== FIGURES (screenshots / diagrams) ===== */
+.figure {
+  margin: 18px auto 4px;
+  max-width: 760px;
+  text-align: center;
+}
+
+.figure img {
+  width: 100%;
+  height: auto;
+  display: block;
+  border: 3px solid var(--girder);
+  border-radius: 4px;
+  box-shadow: 0 0 24px rgba(0, 0, 0, 0.5);
+  transition: border-color 0.2s;
+}
+
+.figure img:hover { border-color: var(--cyan); }
+
+.figure figcaption {
+  font-size: 8px;
+  color: var(--dim);
+  line-height: 2;
+  letter-spacing: 1px;
+  margin-top: 12px;
+}
+
 /* ===== TEAM CARDS ===== */
 .team-grid {
   display: grid;
@@ -362,11 +389,13 @@ html { scroll-behavior: smooth; }
   <!-- ===== MENU (DK style) ===== -->
   <ul class="menu" id="nav-menu">
     <li class="active"><a href="#about">ABOUT THE PROJECT</a></li>
+    <li><a href="#team">THE TEAM</a></li>
     <li><a href="#demo">DEMO VIDEO</a></li>
+    <li><a href="#ai-vision">AI VISION</a></li>
+    <li><a href="#training">PPO TRAINING</a></li>
     <li><a href="#how-it-works">HOW IT WORKS</a></li>
     <li><a href="#robot-arms">ROBOT ARMS</a></li>
     <li><a href="#setup">SETUP INSTRUCTIONS</a></li>
-    <li><a href="#team">THE TEAM</a></li>
   </ul>
 
   <div class="girder"></div>
@@ -391,6 +420,35 @@ html { scroll-behavior: smooth; }
 
   <div class="girder"></div>
 
+  <!-- ===== TEAM ===== -->
+  <section id="team">
+    <h2>THE TEAM</h2>
+    <div class="team-grid">
+      <div class="team-card">
+        <img class="avatar" src="media/abael.jpeg" alt="Abael" loading="lazy">
+        <div class="name">ABAEL</div>
+        <div class="role">Environment wrapper, reward shaping,<br>OAM sprite detection, ghost viewer</div>
+      </div>
+      <div class="team-card">
+        <img class="avatar" src="media/ben.jpeg" alt="Ben" loading="lazy">
+        <div class="name">BEN</div>
+        <div class="role">Built the robotic-arm simulation,<br>ported it to run on CPU-only machines,<br>created the project website</div>
+      </div>
+      <div class="team-card">
+        <img class="avatar" src="media/samir.png" alt="Samir" loading="lazy">
+        <div class="name">SAMIR</div>
+        <div class="role">Real-time robotic-arm interaction,<br>lead video production,<br>early agent training experiments</div>
+      </div>
+      <div class="team-card">
+        <img class="avatar" src="media/nikhil.jpeg" alt="Nikhil" loading="lazy">
+        <div class="name">NIKHIL</div>
+        <div class="role">Evaluated &amp; validated the agent's progress,<br>monitored training and ran the agent for<br>millions of sessions on his hardware</div>
+      </div>
+    </div>
+  </section>
+
+  <div class="girder"></div>
+
   <!-- ===== DEMO VIDEO ===== -->
   <section id="demo">
     <h2>DEMO VIDEO</h2>
@@ -409,22 +467,60 @@ html { scroll-behavior: smooth; }
 
   <div class="girder"></div>
 
+  <!-- ===== AI VISION ===== -->
+  <section id="ai-vision">
+    <h2>AI VISION</h2>
+    <p>
+      The agent never sees the game the way we do. Every frame is shrunk to greyscale and
+      stacked four-deep so the network can sense motion, then fed into a
+      <span style="color:var(--orange)">convolutional neural network</span> (CNN) — the same
+      kind of model used in image recognition. On top of the raw pixels we add a few extra
+      channels that highlight the things that matter most: barrels, ladders, and fireballs.
+    </p>
+    <div class="figure">
+      <img src="media/ai-vision.png" alt="What the AI sees: the CNN input view of the game" loading="lazy">
+      <figcaption>WHAT THE AGENT SEES &mdash; THE PROCESSED CNN INPUT ALONGSIDE THE LIVE GAME</figcaption>
+    </div>
+    <p style="margin-top:14px">
+      From this compressed view alone, the CNN learns to recognise where Mario is, where the
+      hazards are, and which way leads up. There is no memory of the level layout and no map —
+      the agent reacts to what it can see, frame by frame, and chooses one of 8 actions.
+    </p>
+  </section>
+
+  <div class="girder"></div>
+
+  <!-- ===== PPO TRAINING ===== -->
+  <section id="training">
+    <h2>PPO TRAINING</h2>
+    <p>
+      The agent learns with <span style="color:var(--orange)">PPO</span> (Proximal Policy
+      Optimisation), a reinforcement-learning algorithm that gradually nudges the policy toward
+      actions that earned more reward. It learns purely from experience: climb higher and you
+      gain reward, get hit by a barrel or fall and you lose it — no human gameplay data is ever
+      shown to it.
+    </p>
+    <div class="figure">
+      <img src="media/ppo-training.png" alt="PPO training reward curve over millions of steps" loading="lazy">
+      <figcaption>TRAINING PROGRESS &mdash; REWARD CLIMBING ACROSS MILLIONS OF STEPS</figcaption>
+    </div>
+    <p style="margin-top:14px">
+      Training ran across many parallel game instances at once, playing through millions of
+      sessions. Several independent runs were compared, and the strongest model was selected and
+      pushed to its full potential over roughly <span style="color:var(--yellow)">20 million
+      steps</span> of practice — the equivalent of months of non-stop human play.
+    </p>
+  </section>
+
+  <div class="girder"></div>
+
   <!-- ===== HOW IT WORKS ===== -->
   <section id="how-it-works">
     <h2>HOW IT WORKS</h2>
-
-    <h3>THE AI</h3>
     <p>
-      The agent receives a stack of preprocessed game frames (greyscale + sprite channels)
-      and outputs one of 8 discrete actions every decision step. A reward function encourages
-      climbing higher, dodging barrels, and reaching Pauline at the top.
-    </p>
-
-    <h3>TRAINING</h3>
-    <p>
-      PPO runs across multiple parallel NES emulators (via stable-retro), collecting rollouts
-      and updating the CNN policy. Platform checkpoints let the agent drill individual
-      transitions (curriculum learning). 10M+ timesteps are recommended for consistent climbing.
+      Under the hood, here is exactly what the agent reads in and what it can do. The network
+      receives a stack of preprocessed channels every decision step and outputs one of 8 discrete
+      actions, which the robot arms then mirror on the cabinet.
     </p>
 
     <h3>OBSERVATION STACK</h3>
@@ -514,10 +610,10 @@ pip install -r requirements.txt</pre>
 
     <h3>6. TRAIN THE AI</h3>
     <pre># Headless (fastest)
-python main.py --algo ppo --timesteps 10000000 --num-envs 8
+python main.py --algo ppo --timesteps 20000000 --num-envs 8
 
 # With game window
-python main.py --algo ppo --timesteps 10000000 --num-envs 8 --render</pre>
+python main.py --algo ppo --timesteps 20000000 --num-envs 8 --render</pre>
 
     <h3>7. WATCH IT PLAY</h3>
     <pre># With robot arms + game window (NO GPU)
@@ -539,35 +635,6 @@ python main.py --algo ppo --eval-only \
       <tr><td>--play-speed N</td><td>Playback speed (default 2.0)</td></tr>
       <tr><td>--checkpoints</td><td>Curriculum learning (platform drilling)</td></tr>
     </table>
-  </section>
-
-  <div class="girder"></div>
-
-  <!-- ===== TEAM ===== -->
-  <section id="team">
-    <h2>THE TEAM</h2>
-    <div class="team-grid">
-      <div class="team-card">
-        <img class="avatar" src="media/abael.jpeg" alt="Abael" loading="lazy">
-        <div class="name">ABAEL</div>
-        <div class="role">Environment wrapper, reward shaping,<br>OAM sprite detection, ghost viewer</div>
-      </div>
-      <div class="team-card">
-        <img class="avatar" src="media/ben.jpeg" alt="Ben" loading="lazy">
-        <div class="name">BEN</div>
-        <div class="role">Built the robotic-arm simulation,<br>ported it to run on CPU-only machines,<br>created the project website</div>
-      </div>
-      <div class="team-card">
-        <img class="avatar" src="media/samir.png" alt="Samir" loading="lazy">
-        <div class="name">SAMIR</div>
-        <div class="role">Real-time robotic-arm interaction,<br>lead video production,<br>early agent training experiments</div>
-      </div>
-      <div class="team-card">
-        <img class="avatar" src="media/nikhil.jpeg" alt="Nikhil" loading="lazy">
-        <div class="name">NIKHIL</div>
-        <div class="role">Evaluated &amp; validated the agent's progress,<br>monitored training and ran the agent for<br>millions of sessions on his hardware</div>
-      </div>
-    </div>
   </section>
 
   <div class="girder"></div>
